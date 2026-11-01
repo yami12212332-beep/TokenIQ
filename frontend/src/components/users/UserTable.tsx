@@ -15,11 +15,11 @@
     Filter
   } from 'lucide-react';
   import { UnifiedUser, UserSegment, Platform } from '../../types/dashboard';
-  import { formatUSD, formatTokens, formatNumber } from '../../utils/analytics';
+  import { formatUSD, formatTokens, formatNumber, calculatePowerScore } from '../../utils/analytics';
 
   interface UserTableProps {
     users: UnifiedUser[];
-    activePlatformTab: 'copilot' | 'claude';
+    activePlatformTab: 'copilot' | 'claude' | 'overall';
   }
 
   type SortKey = 'name' | 'department' | 'prompts' | 'tokens' | 'spend' | 'powerScore' | 'manager' | 'lastActive';
@@ -238,6 +238,37 @@
         </span>
       );
     };
+
+    // The detail modal is scoped to the tab the directory belongs to.
+    // "overall" is the only mode that shows every provider.
+    const showCopilot = activePlatformTab !== 'claude';
+    const showClaude = activePlatformTab !== 'copilot';
+    const spendLabel =
+      activePlatformTab === 'copilot'
+        ? 'Copilot Monthly Spend'
+        : activePlatformTab === 'claude'
+          ? 'Claude Monthly Spend'
+          : 'Total Monthly Spend';
+    const scoreLabel =
+      activePlatformTab === 'copilot'
+        ? 'Copilot Power Score'
+        : activePlatformTab === 'claude'
+          ? 'Claude Power Score'
+          : 'Power Score';
+    const providerSpend = selectedUser
+      ? activePlatformTab === 'copilot'
+        ? selectedUser.copilot?.seatCost ?? 0
+        : activePlatformTab === 'claude'
+          ? selectedUser.claude?.totalMonthlyCost ?? 0
+          : selectedUser.totalSpend
+      : 0;
+    const providerPowerScore = selectedUser
+      ? activePlatformTab === 'copilot'
+        ? calculatePowerScore({ ...selectedUser, claude: undefined })
+        : activePlatformTab === 'claude'
+          ? calculatePowerScore({ ...selectedUser, copilot: undefined })
+          : selectedUser.powerScore
+      : 0;
 
     return (
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
@@ -542,17 +573,17 @@
                 {/* Financial & Power Summary */}
                 <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200/60">
                   <div>
-                    <div className="text-[10px] text-slate-400 uppercase font-semibold">Total Monthly Spend</div>
-                    <div className="text-lg font-bold font-mono text-slate-900">{formatUSD(selectedUser.totalSpend)}</div>
+                    <div className="text-[10px] text-slate-400 uppercase font-semibold">{spendLabel}</div>
+                    <div className="text-lg font-bold font-mono text-slate-900">{formatUSD(providerSpend)}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] text-slate-400 uppercase font-semibold">Power Score</div>
-                    <div className="text-lg font-bold font-mono text-indigo-600">{selectedUser.powerScore} / 100</div>
+                    <div className="text-[10px] text-slate-400 uppercase font-semibold">{scoreLabel}</div>
+                    <div className="text-lg font-bold font-mono text-indigo-600">{providerPowerScore} / 100</div>
                   </div>
                 </div>
 
-                {/* Copilot Telemetry */}
-                {selectedUser.copilot?.licensed ? (
+                {/* Copilot Telemetry (hidden on the Claude tab) */}
+                {showCopilot && (selectedUser.copilot?.licensed ? (
                   <div className="p-4 rounded-xl border border-sky-100 bg-sky-50/40 space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="font-bold text-sky-900 flex items-center gap-1.5">
@@ -572,10 +603,10 @@
                   <div className="p-3 rounded-lg border border-slate-200 text-slate-400 italic">
                     No Copilot license assigned.
                   </div>
-                )}
+                ))}
 
-                {/* Claude Telemetry */}
-                {selectedUser.claude?.licensed ? (
+                {/* Claude Telemetry (hidden on the Copilot tab) */}
+                {showClaude && (selectedUser.claude?.licensed ? (
                   <div className="p-4 rounded-xl border border-orange-100 bg-orange-50/40 space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="font-bold text-orange-900 flex items-center gap-1.5">
@@ -597,7 +628,7 @@
                   <div className="p-3 rounded-lg border border-slate-200 text-slate-400 italic">
                     No Anthropic Claude license assigned.
                   </div>
-                )}
+                ))}
               </div>
 
               <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-end">

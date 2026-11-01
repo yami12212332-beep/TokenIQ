@@ -143,7 +143,7 @@ DB_PASSWORD=1234
 
 CORS_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://localhost:3000,http://127.0.0.1:3000
 COPILOT_SEAT_PRICE=30.0
-CLAUDE_BASE_SEAT_PRICE=40.0
+CLAUDE_BASE_SEAT_PRICE=20.0
 CHATGPT_SEAT_PRICE=30.0
 ```
 
@@ -228,8 +228,6 @@ from a live DB.
 - Sequence names must match the table names (`copilot_*_id_seq`). If you copied
   tables from an older schema, rename the sequences so `seed.sql`'s `setval`
   calls resolve.
-- The Claude/ChatGPT tabs run on frontend demo data while
-  `VITE_USE_DUMMY_DATA=true`. `claude_user_usage_report` and
-  `claude_user_cost_report` are populated by the demo seed, but the backend
-  reads the normalized `claude_usage_user_detail` / `claude_cost_user_detail`
-  tables, which are not part of `simple.sql`. ChatGPT has no tables here.
+- Copilot and Claude read live data. Claude uses `claude_user_usage_report` /
+  `claude_user_cost_report` directly. ChatGPT remains on frontend demo data while
+  `VITE_USE_DUMMY_DATA=true`; its normalized tables are not part of `simple.sql`.

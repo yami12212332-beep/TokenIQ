@@ -99,7 +99,7 @@ export interface ClaudeUsage {
   periodType: TimeGrain;
   licensed: boolean;
   licenseTier: 'Team' | 'Enterprise';
-  seatCost: number; // base seat license e.g. $40
+  seatCost: number; // base seat license e.g. $20
   tokenCostUsd: number; // token consumption cost
   totalMonthlyCost: number; // seatCost + tokenCostUsd
   status: 'Active'; // Claude users are listed only when they have usage in the period

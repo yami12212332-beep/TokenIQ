@@ -176,8 +176,9 @@ Expected after the local demo seed (for reference only):
 - The local seed uses one `created_at` value (2026-10-23); production rows come from the
   loader with their real `created_at` / `updated_at`.
 - The old normalized Claude tables (`claude_usage_user_detail`, `claude_cost_user_detail`,
-  `claude_organization_users`) are **not** used by the new Claude routes. Some dashboard
-  endpoints still reference them, so do not drop them on the server without checking
-  `/api/dashboard/users` and `/api/dashboard/trends`.
+  `claude_organization_users`) are **not** used by the Claude routes or the dashboard
+  endpoints. They are still referenced by the diagnostic `/api/employees/claude-joined`
+  and `/api/employees/ai-active-joined` helpers, so do not drop them unless those are
+  updated too.
 - No destructive migration is included in this branch. All local setup was done on an
   empty database; the server must not be truncated.

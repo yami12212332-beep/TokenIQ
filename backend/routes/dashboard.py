@@ -1,11 +1,13 @@
 """Live dashboard endpoint. All user records originate from PostgreSQL; no demo fallback."""
 import io
-import csv
 from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
-from services.periods import claude_cost_join_extra, claude_usage_period, copilot_detail_period, chatgpt_cost_join_extra, chatgpt_usage_period, chatgpt_cost_period, period_range
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from services.periods import claude_raw_cost_period, claude_raw_usage_period, copilot_detail_period, chatgpt_cost_join_extra, chatgpt_usage_period, chatgpt_cost_period, period_range
 from services.database import query_rows, get_existing_tables, COPILOT_SEAT_PRICE, CLAUDE_BASE_SEAT_PRICE, CHATGPT_SEAT_PRICE
 
 router = APIRouter(prefix="/api/dashboard", tags=["Dashboard"])
@@ -215,11 +217,10 @@ def _fallback_dashboard_trends(period_type: str) -> dict:
 @router.get("/users")
 async def get_dashboard_users(period_key: str = Query(...), period_type: str = Query("MONTHLY", pattern="^(MONTHLY|WEEKLY)$")):
     """Return one joined row per employee with real telemetry for the selected period."""
-    # Only join telemetry tables that actually exist. tokeniq_db currently has
-    # the Copilot tables but no Claude/ChatGPT telemetry, so the Copilot tab must
-    # still be able to read live data instead of falling back to demo records.
+    # Only join telemetry tables that actually exist. Claude reads the raw
+    # Anthropic report tables; ChatGPT still uses the normalized tables.
     tables = await get_existing_tables()
-    has_claude = {"claude_usage_user_detail", "claude_cost_user_detail"} <= tables
+    has_claude = {"claude_user_usage_report", "claude_user_cost_report"} <= tables
     has_chatgpt = {"chatgpt_usage_user_detail", "chatgpt_cost_user_detail"} <= tables
 
     ctes = [f"""
@@ -246,25 +247,32 @@ async def get_dashboard_users(period_key: str = Query(...), period_type: str = Q
     select_cl = join_cl = ""
     if has_claude:
         ctes.append(f"""
+              cl_cost AS (
+                SELECT LOWER(c.actor_email) email,
+                       SUM(COALESCE(c.amount,0)) / 100.0 token_cost
+                FROM claude_user_cost_report c
+                WHERE {claude_raw_cost_period(period_key, 'c')}
+                GROUP BY LOWER(c.actor_email)
+              ),
               cl AS (
-                SELECT COALESCE(u.user_id, w.user_id) user_id,
-                       LOWER(COALESCE(u.email, w.email_work)) email,
-                       MAX(u.display_name) display_name,
-                       SUM(COALESCE(u.input_tokens,0)) input_tokens,
+                SELECT COALESCE(NULLIF(u.actor_user_id,''), LOWER(NULLIF(u.actor_email,''))) user_id,
+                       LOWER(u.actor_email) email,
+                       MAX(u.actor_name) display_name,
+                       SUM(COALESCE(u.uncached_input_tokens,0)) input_tokens,
                        SUM(COALESCE(u.output_tokens,0)) output_tokens,
                        SUM(COALESCE(u.cache_read_input_tokens,0)) cache_read,
-                       SUM(COALESCE(u.cache_creation_input_tokens,0)) cache_create,
-                       SUM(COALESCE(u.request_count,0)) requests,
-                       SUM(COALESCE(c.total_cost_usd,0)) token_cost,
-                       MAX(u.usage_date) last_activity_date,
-                       MAX(u.report_refresh_date) ref_date,
+                       SUM(COALESCE(u.ephemeral_5m_input_tokens,0)
+                           + COALESCE(u.ephemeral_1h_input_tokens,0)) cache_create,
+                       SUM(COALESCE(u.requests,0)) requests,
+                       COALESCE(MAX(cc.token_cost), 0) token_cost,
+                       MAX((u.starting_at AT TIME ZONE 'UTC')::date) last_activity_date,
+                       MAX((u.created_at AT TIME ZONE 'UTC')::date) ref_date,
                        MAX(u.model) model
-                FROM claude_usage_user_detail u
-                LEFT JOIN workday_employees w ON u.user_id = w.user_id OR LOWER(u.email) = LOWER(w.email_work)
-                LEFT JOIN claude_cost_user_detail c
-                  ON c.user_id = u.user_id AND c.report_period = u.report_period AND c.model = u.model AND c.cost_date = u.usage_date{claude_cost_join_extra(period_key)}
-                WHERE {claude_usage_period(period_key, 'u')}
-                GROUP BY COALESCE(u.user_id, w.user_id), LOWER(COALESCE(u.email, w.email_work))
+                FROM claude_user_usage_report u
+                LEFT JOIN cl_cost cc ON LOWER(u.actor_email) = cc.email
+                WHERE {claude_raw_usage_period(period_key, 'u')}
+                GROUP BY COALESCE(NULLIF(u.actor_user_id,''), LOWER(NULLIF(u.actor_email,''))),
+                         LOWER(u.actor_email)
               )""")
         select_cl = """,
                    cl.email cl_email, cl.ref_date cl_ref, cl.input_tokens cl_input_tokens, cl.output_tokens cl_output_tokens, cl.cache_read cl_cache_read,
@@ -436,7 +444,7 @@ async def get_dashboard_trends(
     WEEKLY:  the last 7 days of the latest fetched snapshot.
     """
     tables = await get_existing_tables()
-    has_claude = "claude_usage_user_detail" in tables
+    has_claude = "claude_user_usage_report" in tables
 
     if period_type == "WEEKLY":
         cp_where = (
@@ -461,23 +469,17 @@ async def get_dashboard_trends(
               )"""
 
     if has_claude:
-        if period_type == "WEEKLY":
-            cl_where = (
-                "WHERE report_refresh_date = (SELECT MAX(report_refresh_date) FROM claude_usage_user_detail) "
-                "AND usage_date > (SELECT MAX(usage_date) FROM claude_usage_user_detail) - 7"
-            )
-        elif period_range(period_key)[0] is not None:
-            cl_where = "WHERE usage_date BETWEEN %(period_start)s AND %(period_end)s"
-        else:
-            cl_where = ""
+        cl_where = f"WHERE {claude_raw_usage_period(period_key, 'u')}"
         cl_cte = f""", cl AS (
-                SELECT usage_date::date AS trend_date,
-                       COUNT(DISTINCT user_id) AS cl_active,
-                       SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)
-                           + COALESCE(cache_read_input_tokens,0) + COALESCE(cache_creation_input_tokens,0)) AS cl_tokens
-                FROM claude_usage_user_detail
+                SELECT (u.starting_at AT TIME ZONE 'UTC')::date AS trend_date,
+                       COUNT(DISTINCT COALESCE(NULLIF(u.actor_user_id,''), LOWER(NULLIF(u.actor_email,'')))) AS cl_active,
+                       SUM(COALESCE(u.uncached_input_tokens,0) + COALESCE(u.output_tokens,0)
+                           + COALESCE(u.cache_read_input_tokens,0)
+                           + COALESCE(u.ephemeral_5m_input_tokens,0)
+                           + COALESCE(u.ephemeral_1h_input_tokens,0)) AS cl_tokens
+                FROM claude_user_usage_report u
                 {cl_where}
-                GROUP BY usage_date::date
+                GROUP BY (u.starting_at AT TIME ZONE 'UTC')::date
               )"""
         select_cl = """,
                    COALESCE(cl.cl_active, 0) AS cl_active,
@@ -526,385 +528,749 @@ async def get_dashboard_trends(
     return {"periodType": period_type, "count": len(points), "rows": points}
 
 
+# ============================================================================
+# Excel export (real .xlsx via openpyxl)
+# ============================================================================
+
+COPILOT_EXPORT_HEADERS = [
+    "Employee ID", "Name", "Email", "Department", "Title", "EVP / Manager",
+    "Period", "Copilot Status", "Copilot Prompts Count", "Prompts Work",
+    "Prompts Web", "Apps Used Count", "Active Days Count", "Monthly Seat Cost ($)",
+]
+
+CLAUDE_EXPORT_HEADERS = [
+    "Employee ID", "Name", "Email", "Department", "Business Function", "Title",
+    "EVP / Manager", "Period", "Claude Status", "Requests Count", "Input Tokens",
+    "Output Tokens", "Cache Read Tokens", "Cache Creation Tokens", "Total Tokens",
+    "Token Cost ($)", "Total Monthly Cost ($)", "Model",
+]
+
+CHATGPT_EXPORT_HEADERS = [
+    "Employee ID", "Name", "Email", "Department", "Business Function", "Title",
+    "EVP / Manager", "Period", "ChatGPT Active", "Requests Count", "Input Tokens",
+    "Output Tokens", "Cached Tokens", "Total Tokens", "Token Cost ($)",
+    "Total Monthly Cost ($)",
+]
+
+OVERALL_EXPORT_HEADERS = [
+    "Employee ID", "Name", "Email", "Department", "Title", "EVP / Manager",
+    "Period", "Active Platforms", "Copilot Licensed", "Copilot Status",
+    "Copilot Monthly Cost ($)", "Claude Licensed", "Claude Total Tokens",
+    "Claude Token Cost ($)", "ChatGPT Active", "ChatGPT Total Tokens",
+    "ChatGPT Cost ($)", "Total Combined Spend USD ($)",
+]
+
+DASHBOARD_HEADERS = [
+    "Name", "Employees", "Copilot Active Users", "Copilot Spend ($)",
+    "Claude Active Users", "Claude Seat Cost ($)", "Claude Token Cost ($)",
+    "Claude Total Cost ($)", "ChatGPT Active Users", "ChatGPT Spend ($)",
+    "Total Spend ($)",
+]
+
+CURRENCY = '"$"#,##0.00'
+INTEGER = "#,##0"
+
+
+def _period_mult(period_type: str) -> float:
+    return 1.0 if period_type == "MONTHLY" else 0.25
+
+
+def _window_days(period_type: str) -> int:
+    return 28 if period_type == "MONTHLY" else 7
+
+
+def _yes_no(value: bool) -> str:
+    return "Yes" if value else "No"
+
+
+def _num(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _load_dashboard_users(period_key: str, period_type: str) -> list[dict]:
+    payload = await get_dashboard_users(period_key=period_key, period_type=period_type)
+    return payload.get("users", [])
+
+
+def _copilot_non_workday_query(period_key: str) -> str:
+    return f"""
+        WITH cp AS (
+          SELECT LOWER(user_principal_name) email,
+                 MAX(display_name) display_name,
+                 MAX(last_activity_date) last_activity_date,
+                 MAX(report_refresh_date) ref_date,
+                 MAX(copilot_chat_last_activity_date) chat_date,
+                 MAX(microsoft_teams_copilot_last_activity_date) teams_date,
+                 MAX(word_copilot_last_activity_date) word_date,
+                 MAX(excel_copilot_last_activity_date) excel_date,
+                 MAX(powerpoint_copilot_last_activity_date) powerpoint_date,
+                 MAX(outlook_copilot_last_activity_date) outlook_date,
+                 MAX(onenote_copilot_last_activity_date) onenote_date,
+                 SUM(COALESCE(prompts_submitted_all_apps,0)) prompts,
+                 SUM(COALESCE(prompts_submitted_copilot_chat_work,0)) prompts_work,
+                 SUM(COALESCE(prompts_submitted_copilot_chat_web,0)) prompts_web,
+                 MAX(COALESCE(active_usage_days_all_apps,0)) active_days
+          FROM copilot_usage_user_detail
+          WHERE {copilot_detail_period(period_key)}
+          GROUP BY LOWER(user_principal_name)
+        )
+        SELECT cp.*
+        FROM cp
+        LEFT JOIN workday_employees w ON LOWER(w.email_work) = cp.email
+        WHERE w.email_work IS NULL
+        ORDER BY cp.email
+    """
+
+
+async def _copilot_records(period_key: str, period_type: str) -> list[dict]:
+    users = await _load_dashboard_users(period_key, period_type)
+    records: list[dict] = []
+    for user in users:
+        employee = user.get("employee") or {}
+        copilot = user.get("copilot") or {}
+        licensed = bool(copilot.get("licensed"))
+        records.append(
+            {
+                "employee_id": employee.get("id") or "",
+                "name": employee.get("name") or employee.get("email") or "Unknown",
+                "email": (employee.get("email") or "").lower(),
+                "department": employee.get("department") or "Unassigned",
+                "title": employee.get("title") or "",
+                "evp_manager": employee.get("managerName") or "Unassigned",
+                "period": period_key,
+                "status": copilot.get("status") or "Never used",
+                "prompts": _int(copilot.get("promptsTotal")),
+                "prompts_work": _int(copilot.get("promptsWork")),
+                "prompts_web": _int(copilot.get("promptsWeb")),
+                "apps_used": _int(copilot.get("appsUsedCount")),
+                "active_days": _int(copilot.get("activeDaysCount")),
+                "seat_cost": _num(copilot.get("seatCost")) if licensed else 0.0,
+                "licensed": licensed,
+            }
+        )
+
+    non_workday = await query_rows(_copilot_non_workday_query(period_key), {"period_key": period_key})
+    mult = _period_mult(period_type)
+    window_days = _window_days(period_type)
+    app_cols = ["chat_date", "teams_date", "word_date", "excel_date", "powerpoint_date", "outlook_date", "onenote_date"]
+    for row in non_workday or []:
+        email = (row.get("email") or "").lower()
+        apps_used = 0
+        for col in app_cols:
+            gap = _days_since(row.get("ref_date"), row.get(col))
+            if gap is not None and gap <= window_days:
+                apps_used += 1
+        prompts = _int(row.get("prompts"))
+        active_days = _int(row.get("active_days"))
+        active = prompts > 0 or active_days > 0 or apps_used > 0
+        records.append(
+            {
+                "employee_id": "",
+                "name": row.get("display_name") or email or "Unknown",
+                "email": email,
+                "department": "Unassigned",
+                "title": "",
+                "evp_manager": "Unassigned",
+                "period": period_key,
+                "status": "Active" if active else "Never used",
+                "prompts": prompts,
+                "prompts_work": _int(row.get("prompts_work")),
+                "prompts_web": _int(row.get("prompts_web")),
+                "apps_used": apps_used,
+                "active_days": active_days,
+                "seat_cost": COPILOT_SEAT_PRICE * mult,
+                "licensed": True,
+            }
+        )
+
+    records.sort(key=lambda r: (r["name"].lower(), r["email"]))
+    return records
+
+
+def _copilot_export_rows(records: list[dict]) -> list[list]:
+    rows = []
+    for r in records:
+        rows.append(
+            [
+                r["employee_id"], r["name"], r["email"], r["department"], r["title"],
+                r["evp_manager"], r["period"], r["status"], r["prompts"],
+                r["prompts_work"], r["prompts_web"], r["apps_used"],
+                r["active_days"], round(r["seat_cost"], 2),
+            ]
+        )
+    return rows
+
+
+def _claude_export_query(period_key: str) -> str:
+    usage_period = claude_raw_usage_period(period_key, "u")
+    cost_period = claude_raw_cost_period(period_key, "c")
+    return f"""
+        WITH usage AS (
+          SELECT COALESCE(NULLIF(u.actor_user_id,''), LOWER(NULLIF(u.actor_email,''))) user_key,
+                 u.actor_user_id user_id,
+                 LOWER(u.actor_email) email,
+                 MAX(u.actor_name) display_name,
+                 COALESCE(NULLIF(u.model,''), 'Unknown model') model,
+                 SUM(COALESCE(u.uncached_input_tokens,0)) input_tokens,
+                 SUM(COALESCE(u.output_tokens,0)) output_tokens,
+                 SUM(COALESCE(u.cache_read_input_tokens,0)) cache_read,
+                 SUM(COALESCE(u.ephemeral_5m_input_tokens,0)
+                     + COALESCE(u.ephemeral_1h_input_tokens,0)) cache_create,
+                 SUM(COALESCE(u.requests,0)) requests
+          FROM claude_user_usage_report u
+          WHERE {usage_period}
+          GROUP BY COALESCE(NULLIF(u.actor_user_id,''), LOWER(NULLIF(u.actor_email,''))),
+                   u.actor_user_id, LOWER(u.actor_email), COALESCE(NULLIF(u.model,''), 'Unknown model')
+        ), costs AS (
+          SELECT COALESCE(NULLIF(c.actor_user_id,''), LOWER(NULLIF(c.actor_email,''))) user_key,
+                 COALESCE(NULLIF(c.model,''), 'Unknown model') model,
+                 SUM(COALESCE(c.amount,0)) / 100.0 token_cost
+          FROM claude_user_cost_report c
+          WHERE {cost_period}
+          GROUP BY COALESCE(NULLIF(c.actor_user_id,''), LOWER(NULLIF(c.actor_email,''))),
+                   COALESCE(NULLIF(c.model,''), 'Unknown model')
+        ), w AS (
+          SELECT DISTINCT ON (LOWER(email_work))
+                 LOWER(email_work) email, employee_id, full_name, department, division,
+                 job_title, manager_name, manager_user_name, manager_level_3_user_name
+          FROM workday_employees
+          WHERE NULLIF(TRIM(email_work), '') IS NOT NULL
+          ORDER BY LOWER(email_work)
+        )
+        SELECT u.user_key, u.user_id, u.email, u.display_name, u.model,
+               u.input_tokens, u.output_tokens, u.cache_read, u.cache_create, u.requests,
+               COALESCE(c.token_cost, 0) token_cost,
+               w.employee_id, w.full_name, w.department, w.division, w.job_title,
+               COALESCE(w.manager_name, w.manager_user_name, 'Unassigned') manager_name,
+               COALESCE(NULLIF(w.manager_level_3_user_name, ''), 'Unassigned') evp_name
+        FROM usage u
+        LEFT JOIN costs c ON c.user_key = u.user_key AND c.model = u.model
+        LEFT JOIN w ON w.email = u.email
+        ORDER BY COALESCE(w.full_name, u.display_name, u.email), u.email, u.model
+    """
+
+
+async def _claude_records(period_key: str, period_type: str) -> list[dict]:
+    rows = await query_rows(_claude_export_query(period_key), {"period_key": period_key})
+    mult = _period_mult(period_type)
+    by_user: dict[str, dict] = {}
+    for row in rows or []:
+        key = str(row.get("user_key") or row.get("email") or "unknown")
+        record = by_user.setdefault(
+            key,
+            {
+                "employee_id": str(row.get("employee_id") or ""),
+                "name": row.get("full_name") or row.get("display_name") or row.get("email") or "Unknown",
+                "email": (row.get("email") or "").lower(),
+                "department": row.get("department") or "Unassigned",
+                "business_function": row.get("division") or "Unassigned",
+                "title": row.get("job_title") or "",
+                "evp_manager": row.get("manager_name") or "Unassigned",
+                "evp": row.get("evp_name") or "Unassigned",
+                "period": period_key,
+                "status": "Active",
+                "seat_cost": CLAUDE_BASE_SEAT_PRICE * mult,
+                "requests": 0,
+                "input": 0,
+                "output": 0,
+                "cache_read": 0,
+                "cache_create": 0,
+                "total_tokens": 0,
+                "token_cost": 0.0,
+                "models": [],
+            },
+        )
+        input_tokens = _int(row.get("input_tokens"))
+        output_tokens = _int(row.get("output_tokens"))
+        cache_read = _int(row.get("cache_read"))
+        cache_create = _int(row.get("cache_create"))
+        total_tokens = input_tokens + output_tokens + cache_read + cache_create
+        requests = _int(row.get("requests"))
+        token_cost = _num(row.get("token_cost"))
+        record["requests"] += requests
+        record["input"] += input_tokens
+        record["output"] += output_tokens
+        record["cache_read"] += cache_read
+        record["cache_create"] += cache_create
+        record["total_tokens"] += total_tokens
+        record["token_cost"] += token_cost
+        record["models"].append(
+            {
+                "model": row.get("model") or "Unknown model",
+                "requests": requests,
+                "input": input_tokens,
+                "output": output_tokens,
+                "cache_read": cache_read,
+                "cache_create": cache_create,
+                "total_tokens": total_tokens,
+                "token_cost": token_cost,
+            }
+        )
+
+    records = list(by_user.values())
+    records.sort(key=lambda r: (r["name"].lower(), r["email"]))
+    return records
+
+
+def _claude_export_rows(records: list[dict]) -> list[list]:
+    rows = []
+    for r in records:
+        common = [
+            r["employee_id"], r["name"], r["email"], r["department"],
+            r["business_function"], r["title"], r["evp_manager"], r["period"],
+            r["status"],
+        ]
+        # Separate seat row: token fields are zero, total cost is the seat.
+        rows.append(
+            common
+            + [0, 0, 0, 0, 0, 0, 0.0, round(r["seat_cost"], 2), "Seat"]
+        )
+        for model in r["models"]:
+            rows.append(
+                common
+                + [
+                    model["requests"], model["input"], model["output"],
+                    model["cache_read"], model["cache_create"], model["total_tokens"],
+                    round(model["token_cost"], 2), round(model["token_cost"], 2),
+                    model["model"],
+                ]
+            )
+    return rows
+
+
+def _chatgpt_export_query(period_key: str) -> str:
+    return f"""
+        WITH us AS (
+          SELECT LOWER(email) email, MAX(display_name) display_name,
+                 SUM(COALESCE(input_tokens,0)) input_tokens,
+                 SUM(COALESCE(output_tokens,0)) output_tokens,
+                 SUM(COALESCE(cached_tokens,0)) cached_tokens,
+                 SUM(COALESCE(request_count,0)) requests
+          FROM chatgpt_usage_user_detail
+          WHERE {chatgpt_usage_period(period_key)}
+          GROUP BY LOWER(email)
+        ), cs AS (
+          SELECT LOWER(email) email, SUM(COALESCE(total_cost_usd,0)) token_cost
+          FROM chatgpt_cost_user_detail
+          WHERE {chatgpt_cost_period(period_key)}
+          GROUP BY LOWER(email)
+        )
+        SELECT us.email, us.display_name, us.input_tokens, us.output_tokens,
+               us.cached_tokens, us.requests, COALESCE(cs.token_cost, 0) token_cost,
+               w.employee_id, w.full_name, w.department, w.division, w.job_title,
+               COALESCE(w.manager_name, w.manager_user_name, 'Unassigned') manager_name
+        FROM us
+        LEFT JOIN cs ON us.email = cs.email
+        LEFT JOIN workday_employees w ON us.email = LOWER(w.email_work)
+        ORDER BY COALESCE(w.full_name, us.display_name, us.email)
+    """
+
+
+async def _chatgpt_records(period_key: str, period_type: str) -> tuple[list[dict], bool]:
+    mult = _period_mult(period_type)
+    try:
+        rows = await query_rows(_chatgpt_export_query(period_key), {"period_key": period_key})
+    except Exception:
+        logger.info("ChatGPT tables unavailable; export sheet uses demo rows")
+        rows = None
+
+    records: list[dict] = []
+    if rows is not None:
+        for row in rows:
+            token_cost = _num(row.get("token_cost"))
+            seat_cost = CHATGPT_SEAT_PRICE * mult
+            records.append(
+                {
+                    "employee_id": str(row.get("employee_id") or ""),
+                    "name": row.get("full_name") or row.get("display_name") or row.get("email") or "Unknown",
+                    "email": (row.get("email") or "").lower(),
+                    "department": row.get("department") or "Unassigned",
+                    "business_function": row.get("division") or "Unassigned",
+                    "title": row.get("job_title") or "",
+                    "evp_manager": row.get("manager_name") or "Unassigned",
+                    "period": period_key,
+                    "active": True,
+                    "requests": _int(row.get("requests")),
+                    "input": _int(row.get("input_tokens")),
+                    "output": _int(row.get("output_tokens")),
+                    "cached": _int(row.get("cached_tokens")),
+                    "total_tokens": _int(row.get("input_tokens")) + _int(row.get("output_tokens")) + _int(row.get("cached_tokens")),
+                    "token_cost": token_cost,
+                    "seat_cost": seat_cost,
+                    "total_cost": seat_cost + token_cost,
+                }
+            )
+        return records, False
+
+    # Demo fallback while the chatgpt_* tables are absent.
+    for user in _fallback_dashboard_users(period_key, period_type)["users"]:
+        chatgpt = user.get("chatgpt")
+        if not chatgpt:
+            continue
+        employee = user.get("employee") or {}
+        token_cost = _num(chatgpt.get("tokenCostUsd"))
+        seat_cost = _num(chatgpt.get("seatCost"))
+        records.append(
+            {
+                "employee_id": employee.get("id") or "",
+                "name": employee.get("name") or employee.get("email") or "Unknown",
+                "email": (employee.get("email") or "").lower(),
+                "department": employee.get("department") or "Unassigned",
+                "business_function": employee.get("businessFunction") or "Unassigned",
+                "title": employee.get("title") or "",
+                "evp_manager": employee.get("managerName") or "Unassigned",
+                "period": period_key,
+                "active": True,
+                "requests": _int(chatgpt.get("requestCount")),
+                "input": _int(chatgpt.get("inputTokens")),
+                "output": _int(chatgpt.get("outputTokens")),
+                "cached": _int(chatgpt.get("cachedTokens")),
+                "total_tokens": _int(chatgpt.get("totalTokens")),
+                "token_cost": token_cost,
+                "seat_cost": seat_cost,
+                "total_cost": seat_cost + token_cost,
+            }
+        )
+    return records, True
+
+
+def _chatgpt_export_rows(records: list[dict]) -> list[list]:
+    rows = []
+    for r in records:
+        rows.append(
+            [
+                r["employee_id"], r["name"], r["email"], r["department"],
+                r["business_function"], r["title"], r["evp_manager"], r["period"],
+                _yes_no(r["active"]), r["requests"], r["input"], r["output"],
+                r["cached"], r["total_tokens"], round(r["token_cost"], 2),
+                round(r["total_cost"], 2),
+            ]
+        )
+    return rows
+
+
+def _overall_records(
+    workday_users: list[dict],
+    copilot: list[dict],
+    claude: list[dict],
+    chatgpt: list[dict],
+    chatgpt_is_demo: bool,
+) -> list[dict]:
+    workday_by_email = {
+        (u.get("employee", {}).get("email") or "").lower(): u
+        for u in workday_users
+        if u.get("employee", {}).get("email")
+    }
+    copilot_by_email = {r["email"]: r for r in copilot if r["email"]}
+    claude_by_email = {r["email"]: r for r in claude if r["email"]}
+    chatgpt_by_email = {r["email"]: r for r in chatgpt if r["email"]}
+
+    emails = set(workday_by_email) | set(copilot_by_email) | set(claude_by_email)
+    if not chatgpt_is_demo:
+        emails |= set(chatgpt_by_email)
+
+    records: list[dict] = []
+    for email in sorted(emails):
+        workday = workday_by_email.get(email)
+        cp = copilot_by_email.get(email)
+        cl = claude_by_email.get(email)
+        cg = chatgpt_by_email.get(email)
+
+        if workday:
+            employee = workday.get("employee") or {}
+            employee_id = employee.get("id") or ""
+            name = employee.get("name") or email
+            department = employee.get("department") or "Unassigned"
+            title = employee.get("title") or ""
+            evp = employee.get("managerLevel3UserName") or "Unassigned"
+            evp_manager = employee.get("managerName") or "Unassigned"
+        else:
+            source = cp or cl or cg or {}
+            employee_id = source.get("employee_id") or ""
+            name = source.get("name") or email
+            department = source.get("department") or "Unassigned"
+            title = source.get("title") or ""
+            evp = "Unassigned"
+            evp_manager = source.get("evp_manager") or "Unassigned"
+
+        copilot_licensed = bool(cp and cp.get("licensed"))
+        copilot_status = cp.get("status") if copilot_licensed else "N/A"
+        copilot_monthly = _num(cp.get("seat_cost")) if copilot_licensed else 0.0
+
+        claude_licensed = bool(cl)
+        claude_tokens = _int(cl.get("total_tokens")) if cl else 0
+        claude_token_cost = _num(cl.get("token_cost")) if cl else 0.0
+        claude_total_cost = (claude_token_cost + _num(cl.get("seat_cost"))) if cl else 0.0
+
+        chatgpt_active = bool(cg and cg.get("active"))
+        chatgpt_tokens = _int(cg.get("total_tokens")) if cg else 0
+        chatgpt_cost = _num(cg.get("total_cost")) if cg else 0.0
+
+        platforms = []
+        if copilot_licensed:
+            platforms.append("copilot")
+        if claude_licensed:
+            platforms.append("claude")
+        if chatgpt_active:
+            platforms.append("chatgpt")
+        if len(platforms) > 1:
+            platform_label = "both"
+        elif platforms:
+            platform_label = platforms[0]
+        else:
+            platform_label = "none"
+
+        records.append(
+            {
+                "employee_id": employee_id,
+                "name": name,
+                "email": email,
+                "department": department,
+                "title": title,
+                "evp_manager": evp_manager,
+                "evp": evp,
+                "period": cl.get("period") if cl else (cp.get("period") if cp else ""),
+                "platform_label": platform_label,
+                "copilot_licensed": copilot_licensed,
+                "copilot_status": copilot_status,
+                "copilot_monthly": copilot_monthly,
+                "claude_licensed": claude_licensed,
+                "claude_tokens": claude_tokens,
+                "claude_token_cost": claude_token_cost,
+                "claude_total_cost": claude_total_cost,
+                "chatgpt_active": chatgpt_active,
+                "chatgpt_tokens": chatgpt_tokens,
+                "chatgpt_cost": chatgpt_cost,
+                "total_spend": copilot_monthly + claude_total_cost + chatgpt_cost,
+            }
+        )
+
+    # The Overall sheet and its dashboard summary only include users who hold at
+    # least one provider licence (Copilot, Claude, or ChatGPT). Workday-only
+    # employees with no licence are excluded.
+    records = [
+        r for r in records
+        if r["copilot_licensed"] or r["claude_licensed"] or r["chatgpt_active"]
+    ]
+    records.sort(key=lambda r: (r["name"].lower(), r["email"]))
+    return records
+
+
+def _overall_export_rows(records: list[dict], period_key: str) -> list[list]:
+    rows = []
+    for r in records:
+        rows.append(
+            [
+                r["employee_id"], r["name"], r["email"], r["department"], r["title"],
+                r["evp_manager"], period_key, r["platform_label"],
+                _yes_no(r["copilot_licensed"]), r["copilot_status"],
+                round(r["copilot_monthly"], 2),
+                _yes_no(r["claude_licensed"]), r["claude_tokens"],
+                round(r["claude_token_cost"], 2),
+                _yes_no(r["chatgpt_active"]), r["chatgpt_tokens"],
+                round(r["chatgpt_cost"], 2), round(r["total_spend"], 2),
+            ]
+        )
+    return rows
+
+
+def _summary_rows(records: list[dict], key: str) -> list[list]:
+    grouped: dict[str, dict] = {}
+    for r in records:
+        name = r.get(key) or "Unassigned"
+        g = grouped.setdefault(
+            name,
+            {
+                "name": name,
+                "employees": 0,
+                "copilot_active": 0,
+                "copilot_spend": 0.0,
+                "claude_active": 0,
+                "claude_seat": 0.0,
+                "claude_token": 0.0,
+                "claude_total": 0.0,
+                "chatgpt_active": 0,
+                "chatgpt_spend": 0.0,
+                "total_spend": 0.0,
+            },
+        )
+        g["employees"] += 1
+        if r["copilot_status"] == "Active":
+            g["copilot_active"] += 1
+        g["copilot_spend"] += r["copilot_monthly"]
+        if r["claude_licensed"]:
+            g["claude_active"] += 1
+        g["claude_seat"] += (r["claude_total_cost"] - r["claude_token_cost"]) if r["claude_licensed"] else 0.0
+        g["claude_token"] += r["claude_token_cost"]
+        g["claude_total"] += r["claude_total_cost"]
+        if r["chatgpt_active"]:
+            g["chatgpt_active"] += 1
+        g["chatgpt_spend"] += r["chatgpt_cost"]
+        g["total_spend"] += r["total_spend"]
+
+    rows = []
+    for g in sorted(grouped.values(), key=lambda x: (-x["total_spend"], x["name"].lower())):
+        rows.append(
+            [
+                g["name"], g["employees"], g["copilot_active"], round(g["copilot_spend"], 2),
+                g["claude_active"], round(g["claude_seat"], 2), round(g["claude_token"], 2),
+                round(g["claude_total"], 2), g["chatgpt_active"], round(g["chatgpt_spend"], 2),
+                round(g["total_spend"], 2),
+            ]
+        )
+    return rows
+
+
+def _style_header(ws, row: int, count: int) -> None:
+    for col in range(1, count + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def _write_table(ws, headers: list[str], rows: list[list], start_row: int = 1, formats: dict | None = None) -> int:
+    header_row = start_row
+    for col, header in enumerate(headers, 1):
+        ws.cell(row=header_row, column=col, value=header)
+    _style_header(ws, header_row, len(headers))
+
+    row = header_row + 1
+    for data in rows:
+        for col, value in enumerate(data, 1):
+            cell = ws.cell(row=row, column=col, value=value)
+            if formats and col in formats:
+                cell.number_format = formats[col]
+        row += 1
+
+    for col in range(1, len(headers) + 1):
+        width = max(
+            [len(str(headers[col - 1]))]
+            + [len(str(data[col - 1])) for data in rows if len(data) >= col]
+            + [10]
+        )
+        ws.column_dimensions[get_column_letter(col)].width = min(45, max(12, width + 2))
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+    return row
+
+
+def _write_dashboard_sheet(ws, dept_rows: list[list], evp_rows: list[list], period_key: str) -> None:
+    ws.cell(row=1, column=1, value=f"TokenIQ Dashboard — {period_key}").font = Font(bold=True, size=14)
+    next_row = _write_table(ws, DASHBOARD_HEADERS, dept_rows, start_row=3, formats={
+        4: CURRENCY, 6: CURRENCY, 7: CURRENCY, 8: CURRENCY, 10: CURRENCY, 11: CURRENCY,
+    })
+    ws.cell(row=next_row + 1, column=1, value="By EVP").font = Font(bold=True, size=12)
+    _write_table(ws, DASHBOARD_HEADERS, evp_rows, start_row=next_row + 2, formats={
+        4: CURRENCY, 6: CURRENCY, 7: CURRENCY, 8: CURRENCY, 10: CURRENCY, 11: CURRENCY,
+    })
+
+
+def _xlsx_response(workbook: Workbook, filename: str) -> Response:
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/export-excel")
 async def export_dashboard_excel(
     period_key: str = Query(...),
     period_type: str = Query("MONTHLY", pattern="^(MONTHLY|WEEKLY)$"),
-    tab: Optional[str] = Query("overall")
+    tab: Optional[str] = Query("overall"),
 ):
-    """Generate and stream tab-specific backend-verified Excel spreadsheet (.xlsx/.csv with UTF-8 BOM)."""
+    """Build a real Excel workbook for the selected tab.
+
+    Copilot / Claude / ChatGPT tabs: one sheet.
+    Overall: Dashboard summary + Overall + Copilot + Claude + ChatGPT sheets.
+    """
     current_tab = (tab or "overall").lower()
-    output = io.StringIO()
-    output.write('\ufeff')
-    writer = csv.writer(output)
+    period_type = period_type.upper()
 
-    # 1. COPILOT TAB EXPORT: Query ALL users from copilot table left joining workday employees table
-    if current_tab == "copilot":
-        headers = [
-            "Employee ID", "Name", "Email", "Department", "Business Function",
-            "Title", "EVP / Manager", "Period", "Copilot Status", "Copilot Prompts Count",
-            "Prompts Work", "Prompts Web", "Apps Used Count", "Active Days Count", "Monthly Seat Cost ($)"
-        ]
-        writer.writerow(headers)
+    try:
+        workday_users = await _load_dashboard_users(period_key, period_type)
+        copilot = await _copilot_records(period_key, period_type)
+        claude = await _claude_records(period_key, period_type)
+        chatgpt, chatgpt_is_demo = await _chatgpt_records(period_key, period_type)
 
-        mult = 1.0 if period_type == "MONTHLY" else 0.25
-        window_days = 28 if period_type == "MONTHLY" else 7
+        if current_tab == "copilot":
+            workbook = Workbook()
+            ws = workbook.active
+            ws.title = "Copilot"
+            _write_table(ws, COPILOT_EXPORT_HEADERS, _copilot_export_rows(copilot), formats={14: CURRENCY})
+            return _xlsx_response(workbook, f"TokenIQ_Copilot_{period_key}.xlsx")
 
-        try:
-            copilot_rows = await query_rows(f"""
-                WITH cp AS (
-                  SELECT LOWER(user_principal_name) email,
-                         MAX(last_activity_date) last_activity_date,
-                         MAX(report_refresh_date) ref_date,
-                         MAX(copilot_chat_last_activity_date) chat_date,
-                         MAX(microsoft_teams_copilot_last_activity_date) teams_date,
-                         MAX(word_copilot_last_activity_date) word_date,
-                         MAX(excel_copilot_last_activity_date) excel_date,
-                         MAX(powerpoint_copilot_last_activity_date) powerpoint_date,
-                         MAX(outlook_copilot_last_activity_date) outlook_date,
-                         MAX(onenote_copilot_last_activity_date) onenote_date,
-                         SUM(COALESCE(prompts_submitted_all_apps,0)) prompts,
-                         SUM(COALESCE(prompts_submitted_copilot_chat_work,0)) prompts_work,
-                         SUM(COALESCE(prompts_submitted_copilot_chat_web,0)) prompts_web,
-                         MAX(COALESCE(active_usage_days_all_apps,0)) active_days
-                  FROM copilot_usage_user_detail
-                  WHERE {copilot_detail_period(period_key)}
-                  GROUP BY LOWER(user_principal_name)
-                )
-                SELECT cp.email AS cp_email,
-                       w.employee_id, w.full_name, w.email_work, w.department,
-                       w.division AS business_function, w.job_title,
-                       COALESCE(w.manager_name, w.manager_user_name, 'Unassigned') AS manager_name,
-                       cp.last_activity_date, cp.ref_date,
-                       cp.chat_date, cp.teams_date, cp.word_date, cp.excel_date,
-                       cp.powerpoint_date, cp.outlook_date, cp.onenote_date,
-                       cp.prompts, cp.prompts_work, cp.prompts_web, cp.active_days
-                FROM workday_employees w
-                LEFT JOIN cp ON LOWER(w.email_work) = cp.email
-                WHERE w.employee_status IS NULL OR w.employee_status IN ('Active', 'ACTIVE')
-                ORDER BY COALESCE(w.full_name, w.email_work)
-            """, {"period_key": period_key})
-        except Exception:
-            copilot_rows = []
+        if current_tab == "claude":
+            workbook = Workbook()
+            ws = workbook.active
+            ws.title = "Claude"
+            _write_table(ws, CLAUDE_EXPORT_HEADERS, _claude_export_rows(claude), formats={
+                10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER, 15: INTEGER,
+                16: CURRENCY, 17: CURRENCY,
+            })
+            return _xlsx_response(workbook, f"TokenIQ_Claude_{period_key}.xlsx")
 
-        if copilot_rows:
-            for r in copilot_rows:
-                prompts = int(r.get("prompts") or 0)
-                active_days = int(r.get("active_days") or 0)
-                apps_used = 0
-                for col in ["chat_date", "teams_date", "word_date", "excel_date", "powerpoint_date", "outlook_date", "onenote_date"]:
-                    gap = _days_since(r.get("ref_date"), r.get(col))
-                    if gap is not None and gap <= window_days:
-                        apps_used += 1
-                cp_active = prompts > 0 or active_days > 0 or apps_used > 0
-                cp_status = "Active" if cp_active else "Never used"
-                cp_seat = COPILOT_SEAT_PRICE * mult
+        if current_tab == "chatgpt":
+            workbook = Workbook()
+            ws = workbook.active
+            ws.title = "ChatGPT"
+            start_row = 1
+            if chatgpt_is_demo:
+                ws.cell(row=1, column=1, value="Demo data — chatgpt_* tables are not loaded.").font = Font(italic=True, color="C00000")
+                start_row = 3
+            _write_table(ws, CHATGPT_EXPORT_HEADERS, _chatgpt_export_rows(chatgpt), start_row=start_row, formats={
+                10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER,
+                15: CURRENCY, 16: CURRENCY,
+            })
+            return _xlsx_response(workbook, f"TokenIQ_ChatGPT_{period_key}.xlsx")
 
-                writer.writerow([
-                    r.get("employee_id") or "",
-                    r.get("full_name") or r.get("cp_email") or "Unknown",
-                    r.get("email_work") or r.get("cp_email") or "",
-                    r.get("department") or "Unassigned",
-                    r.get("business_function") or "Unassigned",
-                    r.get("job_title") or "",
-                    r.get("manager_name") or "Unassigned",
-                    period_key,
-                    cp_status,
-                    prompts,
-                    int(r.get("prompts_work") or 0),
-                    int(r.get("prompts_web") or 0),
-                    apps_used,
-                    active_days,
-                    cp_seat,
-                ])
-        else:
-            fallback_u = _fallback_dashboard_users(period_key, period_type)["users"]
-            for u in fallback_u:
-                emp = u.get("employee") or {}
-                cp = u.get("copilot") or {}
-                writer.writerow([
-                    emp.get("id") or "",
-                    emp.get("name") or "Unknown",
-                    emp.get("email") or "",
-                    emp.get("department") or "Unassigned",
-                    emp.get("businessFunction") or "Unassigned",
-                    emp.get("title") or "",
-                    emp.get("managerName") or "Unassigned",
-                    period_key,
-                    cp.get("status") or "Active",
-                    cp.get("promptsTotal") or 0,
-                    cp.get("promptsWork") or 0,
-                    cp.get("promptsWeb") or 0,
-                    cp.get("appsUsedCount") or 0,
-                    cp.get("activeDaysCount") or 0,
-                    cp.get("seatCost") or (COPILOT_SEAT_PRICE * mult),
-                ])
+        # Overall workbook: 5 sheets.
+        overall = _overall_records(workday_users, copilot, claude, chatgpt, chatgpt_is_demo)
+        dept_rows = _summary_rows(overall, "department")
+        evp_rows = _summary_rows(overall, "evp")
 
-    # 2. CLAUDE TAB EXPORT: Query ALL users from claude table left joining workday employees table
-    elif current_tab == "claude":
-        headers = [
-            "Employee ID", "Name", "Email", "Department", "Business Function",
-            "Title", "EVP / Manager", "Period", "Claude Plan Tier", "Claude Status",
-            "Requests Count", "Input Tokens", "Output Tokens", "Cache Read Tokens",
-            "Cache Creation Tokens", "Total Tokens", "Token Cost ($)", "Total Monthly Cost ($)", "Favorite Model"
-        ]
-        writer.writerow(headers)
+        workbook = Workbook()
+        dashboard = workbook.active
+        dashboard.title = "Dashboard"
+        _write_dashboard_sheet(dashboard, dept_rows, evp_rows, period_key)
 
-        mult = 1.0 if period_type == "MONTHLY" else 0.25
-        try:
-            claude_rows = await query_rows(f"""
-                WITH us AS (
-                  SELECT COALESCE(u.user_id, w.user_id) user_id,
-                         LOWER(COALESCE(u.email, w.email_work)) email,
-                         MAX(u.display_name) display_name,
-                         SUM(COALESCE(u.input_tokens,0)) input_tokens,
-                         SUM(COALESCE(u.output_tokens,0)) output_tokens,
-                         SUM(COALESCE(u.cache_read_input_tokens,0)) cache_read,
-                         SUM(COALESCE(u.cache_creation_input_tokens,0)) cache_create,
-                         SUM(COALESCE(u.request_count,0)) requests,
-                         SUM(COALESCE(c.total_cost_usd,0)) token_cost,
-                         MAX(u.model) model
-                  FROM claude_usage_user_detail u
-                  LEFT JOIN workday_employees w ON u.user_id = w.user_id OR LOWER(u.email) = LOWER(w.email_work)
-                  LEFT JOIN claude_cost_user_detail c
-                    ON c.user_id = u.user_id AND c.report_period = u.report_period AND c.model = u.model AND c.cost_date = u.usage_date{claude_cost_join_extra(period_key)}
-                  WHERE {claude_usage_period(period_key, 'u')}
-                  GROUP BY COALESCE(u.user_id, w.user_id), LOWER(COALESCE(u.email, w.email_work))
-                )
-                SELECT us.email AS cl_email,
-                       w.employee_id, w.full_name, w.email_work, w.department,
-                       w.division AS business_function, w.job_title,
-                       COALESCE(w.manager_name, w.manager_user_name, 'Unassigned') AS manager_name,
-                       us.input_tokens, us.output_tokens, us.cache_read, us.cache_create,
-                       us.requests, us.token_cost, us.model
-                FROM us
-                LEFT JOIN workday_employees w ON us.email = LOWER(w.email_work) OR us.user_id = w.user_id
-                ORDER BY COALESCE(w.full_name, us.email)
-            """, {"period_key": period_key})
-        except Exception:
-            claude_rows = []
+        overall_sheet = workbook.create_sheet("Overall")
+        _write_table(overall_sheet, OVERALL_EXPORT_HEADERS, _overall_export_rows(overall, period_key), formats={
+            11: CURRENCY, 13: INTEGER, 14: CURRENCY, 16: INTEGER, 17: CURRENCY, 18: CURRENCY,
+        })
 
-        if claude_rows:
-            for r in claude_rows:
-                inp = int(r.get("input_tokens") or 0)
-                outp = int(r.get("output_tokens") or 0)
-                cr = int(r.get("cache_read") or 0)
-                cc = int(r.get("cache_create") or 0)
-                tot_tokens = inp + outp + cr + cc
-                tok_cost = float(r.get("token_cost") or 0)
-                seat_cost = CLAUDE_BASE_SEAT_PRICE * mult
-                writer.writerow([
-                    r.get("employee_id") or "",
-                    r.get("full_name") or r.get("cl_email") or "Unknown",
-                    r.get("email_work") or r.get("cl_email") or "",
-                    r.get("department") or "Unassigned",
-                    r.get("business_function") or "Unassigned",
-                    r.get("job_title") or "",
-                    r.get("manager_name") or "Unassigned",
-                    period_key,
-                    "Enterprise",
-                    "Active",
-                    int(r.get("requests") or 0),
-                    inp,
-                    outp,
-                    cr,
-                    cc,
-                    tot_tokens,
-                    round(tok_cost, 2),
-                    round(seat_cost + tok_cost, 2),
-                    r.get("model") or "claude-3-5-sonnet",
-                ])
-        else:
-            fallback_u = _fallback_dashboard_users(period_key, period_type)["users"]
-            for u in fallback_u:
-                emp = u.get("employee") or {}
-                writer.writerow([
-                    emp.get("id") or "",
-                    emp.get("name") or "Unknown",
-                    emp.get("email") or "",
-                    emp.get("department") or "Unassigned",
-                    emp.get("businessFunction") or "Unassigned",
-                    emp.get("title") or "",
-                    emp.get("managerName") or "Unassigned",
-                    period_key,
-                    "Enterprise",
-                    "Active",
-                    140,
-                    1200000,
-                    450000,
-                    100000,
-                    50000,
-                    1800000,
-                    25.50,
-                    round((CLAUDE_BASE_SEAT_PRICE * mult) + 25.50, 2),
-                    "claude-3-5-sonnet",
-                ])
+        copilot_sheet = workbook.create_sheet("Copilot")
+        _write_table(copilot_sheet, COPILOT_EXPORT_HEADERS, _copilot_export_rows(copilot), formats={14: CURRENCY})
 
-    # 3. CHATGPT TAB EXPORT: Query ALL users from chatgpt table left joining workday employees table
-    elif current_tab == "chatgpt":
-        headers = [
-            "Employee ID", "Name", "Email", "Department", "Business Function",
-            "Title", "EVP / Manager", "Period", "ChatGPT Active", "Requests Count",
-            "Input Tokens", "Output Tokens", "Cached Tokens", "Total Tokens", "Token Cost ($)", "Total Monthly Cost ($)"
-        ]
-        writer.writerow(headers)
+        claude_sheet = workbook.create_sheet("Claude")
+        _write_table(claude_sheet, CLAUDE_EXPORT_HEADERS, _claude_export_rows(claude), formats={
+            10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER, 15: INTEGER,
+            16: CURRENCY, 17: CURRENCY,
+        })
 
-        mult = 1.0 if period_type == "MONTHLY" else 0.25
-        try:
-            chatgpt_rows = await query_rows(f"""
-                WITH us AS (
-                  SELECT COALESCE(u.user_id, w.user_id) user_id,
-                         LOWER(COALESCE(u.email, w.email_work)) email,
-                         MAX(u.display_name) display_name,
-                         SUM(COALESCE(u.input_tokens,0)) input_tokens,
-                         SUM(COALESCE(u.output_tokens,0)) output_tokens,
-                         SUM(COALESCE(u.cached_tokens,0)) cached_tokens,
-                         SUM(COALESCE(u.request_count,0)) requests,
-                         SUM(COALESCE(c.total_cost_usd,0)) token_cost,
-                         MAX(u.usage_date) last_activity_date
-                  FROM chatgpt_usage_user_detail u
-                  LEFT JOIN workday_employees w ON u.user_id = w.user_id OR LOWER(u.email) = LOWER(w.email_work)
-                  LEFT JOIN chatgpt_cost_user_detail c
-                    ON c.user_id = u.user_id AND c.report_period = u.report_period AND c.model = u.model AND c.cost_date = u.usage_date{chatgpt_cost_join_extra(period_key)}
-                  WHERE {chatgpt_usage_period(period_key, 'u')}
-                  GROUP BY COALESCE(u.user_id, w.user_id), LOWER(COALESCE(u.email, w.email_work))
-                )
-                SELECT us.email AS cg_email,
-                       w.employee_id, w.full_name, w.email_work, w.department,
-                       w.division AS business_function, w.job_title,
-                       COALESCE(w.manager_name, w.manager_user_name, 'Unassigned') AS manager_name,
-                       us.input_tokens, us.output_tokens, us.cached_tokens, us.requests, us.token_cost
-                FROM us
-                LEFT JOIN workday_employees w ON us.email = LOWER(w.email_work) OR us.user_id = w.user_id
-                ORDER BY COALESCE(w.full_name, us.email)
-            """, {"period_key": period_key})
-        except Exception:
-            chatgpt_rows = []
+        chatgpt_sheet = workbook.create_sheet("ChatGPT")
+        start_row = 1
+        if chatgpt_is_demo:
+            chatgpt_sheet.cell(row=1, column=1, value="Demo data — chatgpt_* tables are not loaded.").font = Font(italic=True, color="C00000")
+            start_row = 3
+        _write_table(chatgpt_sheet, CHATGPT_EXPORT_HEADERS, _chatgpt_export_rows(chatgpt), start_row=start_row, formats={
+            10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER,
+            15: CURRENCY, 16: CURRENCY,
+        })
 
-        if chatgpt_rows:
-            for r in chatgpt_rows:
-                inp = int(r.get("input_tokens") or 0)
-                outp = int(r.get("output_tokens") or 0)
-                cached = int(r.get("cached_tokens") or 0)
-                tot_tokens = inp + outp + cached
-                tok_cost = float(r.get("token_cost") or 0)
-                seat_cost = CHATGPT_SEAT_PRICE * mult
-                writer.writerow([
-                    r.get("employee_id") or "",
-                    r.get("full_name") or r.get("cg_email") or "Unknown",
-                    r.get("email_work") or r.get("cg_email") or "",
-                    r.get("department") or "Unassigned",
-                    r.get("business_function") or "Unassigned",
-                    r.get("job_title") or "",
-                    r.get("manager_name") or "Unassigned",
-                    period_key,
-                    "Yes",
-                    int(r.get("requests") or 0),
-                    inp,
-                    outp,
-                    cached,
-                    tot_tokens,
-                    round(tok_cost, 2),
-                    round(seat_cost + tok_cost, 2),
-                ])
-        else:
-            fallback_u = _fallback_dashboard_users(period_key, period_type)["users"]
-            for u in fallback_u:
-                emp = u.get("employee") or {}
-                writer.writerow([
-                    emp.get("id") or "",
-                    emp.get("name") or "Unknown",
-                    emp.get("email") or "",
-                    emp.get("department") or "Unassigned",
-                    emp.get("businessFunction") or "Unassigned",
-                    emp.get("title") or "",
-                    emp.get("managerName") or "Unassigned",
-                    period_key,
-                    "Yes",
-                    95,
-                    850000,
-                    320000,
-                    110000,
-                    1280000,
-                    18.40,
-                    round((CHATGPT_SEAT_PRICE * mult) + 18.40, 2),
-                ])
-
-    # 4. OVERALL TAB EXPORT: All users & combined multi-platform columns
-    else:
-        try:
-            dash_data = await get_dashboard_users(period_key=period_key, period_type=period_type)
-            users = dash_data.get("users", [])
-        except Exception:
-            users = []
-
-        if not users:
-            users = _fallback_dashboard_users(period_key, period_type)["users"]
-
-        headers = [
-            "Employee ID", "Name", "Email", "Department", "Business Function",
-            "Title", "EVP / Manager", "Period", "Active Platforms",
-            "Copilot Licensed", "Copilot Status", "Copilot Prompts Count", "Copilot Monthly Cost ($)",
-            "Claude Licensed", "Claude Plan Tier", "Claude Requests Count", "Claude Total Tokens", "Claude Token Cost ($)",
-            "ChatGPT Active", "ChatGPT Requests Count", "ChatGPT Total Tokens", "ChatGPT Cost ($)",
-            "Power Score", "Total Combined Spend USD ($)"
-        ]
-        writer.writerow(headers)
-
-        for u in users:
-            emp = u.get("employee") or {}
-            cp = u.get("copilot") or {}
-            cl = u.get("claude") or {}
-            cg = u.get("chatgpt") or {}
-
-            cp_licensed = "Yes" if cp.get("licensed") else "No"
-            cp_status = cp.get("status") or "N/A"
-            cp_prompts = cp.get("promptsTotal") or 0
-            cp_cost = cp.get("seatCost") or 0
-
-            cl_licensed = "Yes" if cl.get("licensed") else "No"
-            cl_tier = cl.get("licenseTier") or "N/A"
-            cl_requests = cl.get("requestCount") or 0
-            cl_tokens = cl.get("totalTokens") or 0
-            cl_cost = cl.get("tokenCostUsd") or cl.get("totalMonthlyCost") or 0
-
-            cg_active = "Yes" if cg.get("licensed") else "No"
-            cg_requests = cg.get("requestCount") or 0
-            cg_tokens = cg.get("totalTokens") or 0
-            cg_cost = cg.get("tokenCostUsd") or cg.get("totalMonthlyCost") or 0
-
-            writer.writerow([
-                emp.get("id", ""),
-                emp.get("name", ""),
-                emp.get("email", ""),
-                emp.get("department", ""),
-                emp.get("businessFunction", ""),
-                emp.get("title", ""),
-                emp.get("managerName", ""),
-                period_key,
-                u.get("platforms", "both"),
-                cp_licensed,
-                cp_status,
-                cp_prompts,
-                cp_cost,
-                cl_licensed,
-                cl_tier,
-                cl_requests,
-                cl_tokens,
-                cl_cost,
-                cg_active,
-                cg_requests,
-                cg_tokens,
-                cg_cost,
-                u.get("powerScore", 0),
-                u.get("totalSpend", 0)
-            ])
-
-    excel_data = output.getvalue()
-    filename = f"TokenIQ_{current_tab.capitalize()}_{period_key}.xlsx"
-
-    return Response(
-        content=excel_data.encode('utf-8'),
-        media_type="application/vnd.ms-excel;charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+        return _xlsx_response(workbook, f"TokenIQ_Overall_{period_key}.xlsx")
+    except Exception as exc:
+        logger.exception("Could not build Excel export for tab=%s", current_tab)
+        raise HTTPException(status_code=503, detail=f"Could not build Excel export: {exc}") from exc

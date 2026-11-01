@@ -63,8 +63,9 @@ Health check: `http://127.0.0.1:8001/api/health`
 | Tab | Source |
 | --- | --- |
 | Copilot | Live `tokeniq_db` (`copilot_*` tables) + employee details via the FDW |
-| Overall | Shared `/api/dashboard/users` (+ ChatGPT rows) |
-| Claude / ChatGPT | Frontend demo data while `VITE_USE_DUMMY_DATA=true`; switch to `false` to read `tokeniq_db` |
+| Overall | Live `/api/dashboard/users` + `/api/dashboard/trends` (Copilot + Claude); ChatGPT rows stay demo |
+| Claude | Live `tokeniq_db` raw report tables (`claude_user_usage_report` / `claude_user_cost_report`) + FDW |
+| ChatGPT | Frontend demo data while `VITE_USE_DUMMY_DATA=true` (the `chatgpt_*` tables are not in `simple.sql`) |
 
 The backend rewrites `workday_employees` to `assetiq_fdw.workday_employees`, so
 employee names, departments, and the EVP hierarchy come from `assetiq_db`.

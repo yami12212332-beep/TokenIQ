@@ -168,8 +168,8 @@ proxy: {
 
 Also verified:
 
-- `/api/claude/kpis` monthly → 24 users, **$1,082.65** total ($960 seats + $122.65 tokens)
-- `/api/claude/kpis` weekly → **$223.55**
+- `/api/claude/kpis` monthly → 24 users, **$602.65** total (24 × $20 seats + $122.65 tokens)
+- `/api/claude/kpis` weekly → **$138.55**
 - `/api/claude/models` → Opus 4.1, Sonnet 4.5, Haiku 4.5 with tokens and cost
 - `/api/analytics/by-manager` and `/api/analytics/by-department` → 200 with Claude data
 - August 2026 → 200 with zero metrics (frontend shows its empty state)
@@ -181,24 +181,115 @@ Also verified:
 
 ## 6. Known limitations / next steps
 
-- **Claude tab bottom “User Directory” table is still demo.** It is the shared
-  `UserTable` in `App.tsx`, fed by `getDashboardUsers()`; that path still honors
-  `VITE_USE_DUMMY_DATA=true`. The Claude charts above it are live.
-- **Overall tab remains mostly demo**: `users` and `trend` come from
-  `getDashboardUsers()` / `getDashboardTrends()`. The Claude spend card is live.
 - **ChatGPT tab remains demo**: the `chatgpt_*` tables do not exist in `tokeniq_db`.
+- **Overall UI KPI mixes demo ChatGPT**: the “Users on Any Platform” card can show
+  **63 of 73** because it merges 9 demo ChatGPT-only users (`@example.com`) into
+  live Workday data. The Excel export uses real data only and shows **58**
+  (54 Workday + 4 non-Workday licensed users).
 - `GET /api/employees/claude-joined` still uses the old normalized helper in
   `services/database.py`; the UI does not call it.
 - Three Copilot emails have no Workday match (`lena.fischer`, `nikhil.saini`,
   `sam.rivera`) — intentional seed gap.
-
-The next planned change is to make the Claude User Directory live (Option A: rewrite
-the Claude CTEs in `/api/dashboard/users` and `/api/dashboard/trends`, then use the
-live dashboard payload for the Claude tab and Overall).
+- Claude analytics includes the contractor Alex Mercer (no Workday row); the
+  employee User Directory correctly excludes him.
+- Claude Enterprise has a **20-seat minimum**; the app currently computes seats
+  from active users, so an org with fewer than 20 Claude users would be understated.
 
 ---
 
-## 7. Local-only files (not committed)
+## 7. Follow-up: Claude User Directory + Overall live (Option A)
+
+Implemented after the first push:
+
+- `/api/dashboard/users` Claude CTE now reads `claude_user_usage_report` /
+  `claude_user_cost_report`:
+  - usage and cost aggregated separately by email
+  - cost converted from cents to USD
+  - `ref_date` from `created_at`, `last_activity_date` from `starting_at`
+- `/api/dashboard/trends` Claude series now reads `claude_user_usage_report`
+  with the same monthly / last-7-days interval filter.
+- The Claude Excel export (`tab=claude`) now reads the raw tables.
+- `frontend/src/services/api.ts`: `getDashboardUsers()` and
+  `getDashboardTrends()` always call the backend.
+- Result:
+  - Claude tab bottom User Directory → live (23 Workday employees with Claude
+    usage in Sep/Oct; 16 in the latest 7 days)
+  - Overall tab Copilot + Claude daily series → live
+  - Overall per-user Claude columns → live
+  - Claude Excel export → live
+- ChatGPT remains on demo data.
+
+---
+
+## 8. Claude Enterprise seat price corrected to $20
+
+Anthropic's public Enterprise price is **$20/seat/month** (billed annually,
+20-seat minimum) plus usage at API rates. The app previously used $40.
+
+- Updated `CLAUDE_BASE_SEAT_PRICE` to `20.0` in `backend/.env`,
+  `backend/.env.example`, and the `services/database.py` default.
+- Updated the backend example in `db/README.md` and the comment in
+  `frontend/src/types/dashboard.ts`.
+- Documented the full finding and sources in `CLAUDE_ENTERPRISE_BILLING.md`.
+- Verified:
+  - `/api/claude/kpis` monthly → **$602.65** (24 × $20 + $122.65 tokens)
+  - `/api/claude/kpis` weekly → **$138.55**
+  - Arjun Mehta modal → seat **$20.00** + token **$28.36** = **$48.36**
+- The Claude tab's “Platform Spend” remains token-only; see the billing note for
+  the open decision.
+
+---
+
+## 9. Excel export redesign
+
+The export endpoint now returns a real `.xlsx` workbook (openpyxl), not a CSV
+renamed to `.xlsx`.
+
+- **Copilot** — 14 columns: Employee ID, Name, Email, Department, Title,
+  EVP/Manager, Period, Copilot Status, Prompts, Prompts Work, Prompts Web,
+  Apps Used, Active Days, Monthly Seat Cost.
+  - Includes all Active Workday employees **plus** Copilot telemetry users with no
+    Workday row.
+  - Seat cost is charged only to licensed users.
+- **Claude** — 18 columns: Employee ID, Name, Email, Department, Business
+  Function, Title, EVP/Manager, Period, Claude Status, Requests, Input/Output/
+  Cache Read/Cache Creation tokens, Total Tokens, Token Cost, Total Monthly Cost,
+  Model.
+  - One **Seat** row per user ($20 monthly / $5 weekly), then one row per model.
+  - Includes reporting users with no Workday row (e.g. Alex Mercer).
+- **ChatGPT** — 16 columns, with a visible “demo data” note until the
+  `chatgpt_*` tables are loaded.
+- **Overall** — 5 sheets:
+  1. **Dashboard** — departments, then EVPs, with active users and spend per
+     provider plus total spend. It counts only users with a provider licence;
+     departments/EVPs with no licensed users are omitted.
+  2. **Overall** — 18 user-level columns, filtered to users with at least one
+     provider licence (Copilot, Claude, or ChatGPT), whether or not they have a
+     Workday row. October 2026: 58 users = 54 Workday + 4 non-Workday.
+  3. **Copilot** — the Copilot sheet.
+  4. **Claude** — the Claude sheet.
+  5. **ChatGPT** — the ChatGPT sheet (demo note while tables are absent).
+- Non-Workday telemetry users are included in Copilot, Claude, and Overall with
+  blank Workday fields and `Unassigned` department/EVP.
+- Frontend: export timeout raised to 20 s; the offline fallback now downloads a
+  real `.csv` instead of a mislabelled `.xlsx`.
+- New dependency: `openpyxl>=3.1` in `requirements.txt` and `pyproject.toml`.
+
+---
+
+## 10. Provider-specific user modal
+
+The shared `UserTable` detail modal now respects the active tab:
+
+- **Copilot tab** — shows only the Copilot section and Copilot spend/power score.
+- **Claude tab** — shows only the Claude section and Claude spend/power score.
+- **Overall mode** — supports showing both providers (the Overall table itself
+  already lists all provider columns).
+- The modal no longer shows the combined total spend on provider-specific tabs.
+
+---
+
+## 11. Local-only files (not committed)
 
 - `backend/.env` — local PostgreSQL credentials, port 8001
 - `frontend/.env` — `VITE_API_URL=/`, proxy target, dev port 3001

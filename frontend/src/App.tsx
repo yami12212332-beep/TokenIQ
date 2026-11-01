@@ -21,7 +21,8 @@ import { UserTable } from "./components/users/UserTable";
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabId>("overall");
   // Tabs that render from the shared /dashboard/users payload
-  const usesSharedData = activeTab === "overall" || activeTab === "copilot";
+  const usesSharedData =
+    activeTab === "overall" || activeTab === "copilot" || activeTab === "claude";
   const [selectedDept, setSelectedDept] = useState<DepartmentName | "ALL">(
     "ALL",
   );
@@ -35,7 +36,7 @@ export default function App() {
   const [rawUsers, setRawUsers] = useState<UnifiedUser[]>([]);
   const [trendData, setTrendData] = useState<TrendDataPoint[]>([]);
   const [chatgptUsersMap, setChatgptUsersMap] = useState<Map<string, OverallChatGPTRow>>(new Map());
-  // Separate live data for Copilot. Other tabs continue using deterministic dummy data.
+  // Copilot keeps its own live payload so its filters/error state stay isolated.
   const [copilotRawUsers, setCopilotRawUsers] = useState<UnifiedUser[]>([]);
   const [copilotTrendData, setCopilotTrendData] = useState<TrendDataPoint[]>([]);
   const [copilotDataError, setCopilotDataError] = useState<string | null>(null);
@@ -181,7 +182,7 @@ export default function App() {
     try {
       const response = await fetch(
         `${API_ORIGIN}/api/dashboard/export-excel?period_type=${timeGrain}&period_key=${encodeURIComponent(periodKey)}&tab=${activeTab}`,
-        { signal: AbortSignal.timeout(5000) }
+        { signal: AbortSignal.timeout(20000) }
       );
       if (response.ok) {
         const blob = await response.blob();
@@ -199,15 +200,16 @@ export default function App() {
       // Fall through to client dataset builder if offline
     }
 
-    const downloadExcelFile = (headers: string[], rows: (string | number)[][], filename: string) => {
+    // Offline fallback only: the backend normally returns a real .xlsx workbook.
+    const downloadCsvFallback = (headers: string[], rows: (string | number)[][], filename: string) => {
       const csvData = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
       const blob = new Blob(["\uFEFF" + csvData], {
-        type: "application/vnd.ms-excel;charset=utf-8;",
+        type: "text/csv;charset=utf-8;",
       });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = filename;
+      link.download = filename.replace(/\.xlsx$/i, ".csv");
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -268,7 +270,7 @@ export default function App() {
         ];
       });
 
-      downloadExcelFile(headers, rows, `TokenIQ_Copilot_${periodKey}.xlsx`);
+      downloadCsvFallback(headers, rows, `TokenIQ_Copilot_${periodKey}.xlsx`);
       return;
     }
 
@@ -323,7 +325,7 @@ export default function App() {
         ];
       });
 
-      downloadExcelFile(headers, rows, `TokenIQ_Claude_${periodKey}.xlsx`);
+      downloadCsvFallback(headers, rows, `TokenIQ_Claude_${periodKey}.xlsx`);
       return;
     }
 
@@ -371,7 +373,7 @@ export default function App() {
         ];
       });
 
-      downloadExcelFile(headers, rows, `TokenIQ_ChatGPT_${periodKey}.xlsx`);
+      downloadCsvFallback(headers, rows, `TokenIQ_ChatGPT_${periodKey}.xlsx`);
       return;
     }
 
@@ -453,7 +455,7 @@ export default function App() {
       ];
     });
 
-    downloadExcelFile(headers, rows, `TokenIQ_Overall_${periodKey}.xlsx`);
+    downloadCsvFallback(headers, rows, `TokenIQ_Overall_${periodKey}.xlsx`);
   };
 
   return (

@@ -3,9 +3,9 @@
  * never replaced with generated demo data.
  *
  * Demo mode is controlled by `VITE_USE_DUMMY_DATA` (default: true).
- * - `true`  -> Overall / Claude / ChatGPT are built from `src/data/demoData.json`.
- * - `false` -> every tab (including Overall / Claude / ChatGPT) reads the FastAPI
- *              backend and PostgreSQL. Copilot always reads the backend regardless.
+ * Copilot, Claude, and the shared Overall users/trends always read the FastAPI
+ * backend. Only ChatGPT (and the health demo payload) still use demoData.json
+ * while the flag is true.
  */
 import type {
   PlatformKPIs,
@@ -19,8 +19,6 @@ import {
   demoChatGPTUsers,
   demoHealth,
   demoPlatformKpis,
-  demoTrend,
-  demoUsers,
 } from "./demoData";
 
 // Backend location comes from frontend/.env (VITE_API_URL).
@@ -192,8 +190,8 @@ export interface OverallChatGPTResponse {
 }
 
 /**
- * Demo mode switch. Set `VITE_USE_DUMMY_DATA=false` in frontend/.env to make
- * Overall, Claude and ChatGPT read live PostgreSQL data through the backend.
+ * Demo mode switch. Copilot, Claude and the shared Overall payload are always
+ * live; this flag only controls ChatGPT (and the health demo payload).
  */
 export const USE_DUMMY_DATA =
   (import.meta.env.VITE_USE_DUMMY_DATA ?? "true").toLowerCase() !== "false";
@@ -213,34 +211,20 @@ export const ApiService = {
       `${API_BASE}/copilot/kpis?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
     ),
 
-  // Shared user directory used by the Overall tab (and its UserTable).
-  getDashboardUsers: (periodType: TimeGrain, periodKey: string) => {
-    if (USE_DUMMY_DATA) {
-      const users = demoUsers(periodType, periodKey);
-      return Promise.resolve({
-        periodKey,
-        periodType,
-        count: users.length,
-        users,
-      });
-    }
-    return requestJson<DashboardUsersResponse>(
+  // Shared user directory used by the Overall tab, the Claude tab's UserTable,
+  // and the Copilot tab. Always live: the backend joins Copilot + Claude + Workday.
+  getDashboardUsers: (periodType: TimeGrain, periodKey: string) =>
+    requestJson<DashboardUsersResponse>(
       `${API_BASE}/dashboard/users?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
-    );
-  },
-  getDashboardTrends: (periodType: TimeGrain, periodKey: string) => {
-    if (USE_DUMMY_DATA) {
-      const rows = demoTrend(periodType);
-      return Promise.resolve({ periodType, count: rows.length, rows });
-    }
-    return requestJson<{
+    ),
+  getDashboardTrends: (periodType: TimeGrain, periodKey: string) =>
+    requestJson<{
       periodType: TimeGrain;
       count: number;
       rows: TrendDataPoint[];
     }>(
       `${API_BASE}/dashboard/trends?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
-    );
-  },
+    ),
 
   // Per-user ChatGPT rows the Overall tab merges with the shared directory.
   getOverallChatGPTUsers: (

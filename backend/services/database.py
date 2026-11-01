@@ -24,7 +24,7 @@ from services.periods import period_params, period_range, is_weekly
 logger = logging.getLogger("backend.database")
 
 COPILOT_SEAT_PRICE = float(os.getenv("COPILOT_SEAT_PRICE", "30.0"))
-CLAUDE_BASE_SEAT_PRICE = float(os.getenv("CLAUDE_BASE_SEAT_PRICE", "40.0"))
+CLAUDE_BASE_SEAT_PRICE = float(os.getenv("CLAUDE_BASE_SEAT_PRICE", "20.0"))
 CHATGPT_SEAT_PRICE = float(os.getenv("CHATGPT_SEAT_PRICE", "30.0"))
 
 
