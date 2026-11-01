@@ -1,0 +1,29 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Safety policy for this EDR-protected office machine.
+  // These rules hard-block the command patterns that triggered CrowdStrike.
+  // See AGENTS.md for the full rationale and safe defaults.
+  "permissions": [
+    // No process termination
+    { "action": "shell", "resource": "*taskkill*", "effect": "deny" },
+    { "action": "shell", "resource": "*Stop-Process*", "effect": "deny" },
+    { "action": "shell", "resource": "*pkill*", "effect": "deny" },
+    { "action": "shell", "resource": "*killall*", "effect": "deny" },
+
+    // No credential / secret enumeration
+    { "action": "shell", "resource": "*cmdkey*", "effect": "deny" },
+    { "action": "shell", "resource": "*git credential*", "effect": "deny" },
+
+    // No PowerShell policy bypass / obfuscation
+    { "action": "shell", "resource": "*ExecutionPolicy Bypass*", "effect": "deny" },
+    { "action": "shell", "resource": "*EncodedCommand*", "effect": "deny" },
+    { "action": "shell", "resource": "*Invoke-Expression*", "effect": "deny" },
+
+    // No process / network discovery (use HTTP health checks instead)
+    { "action": "shell", "resource": "*Get-CimInstance Win32_Process*", "effect": "deny" },
+    { "action": "shell", "resource": "*Get-NetTCPConnection*", "effect": "deny" },
+    { "action": "shell", "resource": "*netstat*", "effect": "deny" },
+    { "action": "shell", "resource": "*nmap*", "effect": "deny" }
+  ]
+}
