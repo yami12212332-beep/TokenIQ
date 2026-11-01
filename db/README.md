@@ -110,15 +110,17 @@ clean dataset. Expected row counts:
 | `copilot_usage_user_detail` | 162 |
 | `copilot_user_count_summary` | 3 |
 | `copilot_user_count_trend` | 90 |
-| `claude_user_usage_report` | 0 (demo data has none) |
-| `claude_user_cost_report` | 0 (demo data has none) |
+| `claude_user_usage_report` | 367 (Sep 1-30 + Oct 1-22 2026) |
+| `claude_user_cost_report` | 367 (1:1 with usage, amounts in cents) |
 
 Verify:
 
 ```sql
-SELECT 'usage', count(*) FROM copilot_usage_user_detail
-UNION ALL SELECT 'summary', count(*) FROM copilot_user_count_summary
-UNION ALL SELECT 'trend', count(*) FROM copilot_user_count_trend;
+SELECT 'copilot_usage', count(*) FROM copilot_usage_user_detail
+UNION ALL SELECT 'copilot_summary', count(*) FROM copilot_user_count_summary
+UNION ALL SELECT 'copilot_trend', count(*) FROM copilot_user_count_trend
+UNION ALL SELECT 'claude_usage', count(*) FROM claude_user_usage_report
+UNION ALL SELECT 'claude_cost', count(*) FROM claude_user_cost_report;
 ```
 
 ## 5. Configure environment
@@ -199,14 +201,13 @@ This is why employee names/departments/EVP hierarchy must exist in
 
 ## Regenerating the seeds
 
-The current seeds were produced from a live DB with `pg_dump --inserts`:
+Copilot rows and the employee seed were produced from a live DB with `pg_dump --inserts`:
 
 ```bash
-# tokeniq_db telemetry
+# tokeniq_db Copilot telemetry
 pg_dump -a --inserts --rows-per-insert=50 --no-owner --no-privileges \
   -t copilot_usage_user_detail -t copilot_user_count_summary \
-  -t copilot_user_count_trend -t claude_user_usage_report \
-  -t claude_user_cost_report tokeniq_db
+  -t copilot_user_count_trend tokeniq_db
 
 # assetiq_db employees
 pg_dump -a --inserts --rows-per-insert=50 --no-owner --no-privileges \
@@ -214,6 +215,11 @@ pg_dump -a --inserts --rows-per-insert=50 --no-owner --no-privileges \
 ```
 
 Then prepend a `TRUNCATE ... RESTART IDENTITY;` to the dump output.
+
+The two Claude report tables are deterministic demo data written in the raw
+Anthropic Analytics API shape (Sep 1-30 + Oct 1-22 2026, 367 usage rows and one
+cost row per usage row, `amount` / `list_amount` in cents). They are not dumped
+from a live DB.
 
 ## Notes
 
@@ -223,5 +229,7 @@ Then prepend a `TRUNCATE ... RESTART IDENTITY;` to the dump output.
   tables from an older schema, rename the sequences so `seed.sql`'s `setval`
   calls resolve.
 - The Claude/ChatGPT tabs run on frontend demo data while
-  `VITE_USE_DUMMY_DATA=true`. Their DB tables exist for the ingestion pipeline
-  but are empty in the bundled demo seed.
+  `VITE_USE_DUMMY_DATA=true`. `claude_user_usage_report` and
+  `claude_user_cost_report` are populated by the demo seed, but the backend
+  reads the normalized `claude_usage_user_detail` / `claude_cost_user_detail`
+  tables, which are not part of `simple.sql`. ChatGPT has no tables here.

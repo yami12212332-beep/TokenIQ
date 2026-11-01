@@ -17,7 +17,6 @@ import type { OverallChatGPTRow } from "../utils/overall";
 import {
   demoChatGPTReport,
   demoChatGPTUsers,
-  demoClaudeReport,
   demoHealth,
   demoPlatformKpis,
   demoTrend,
@@ -268,17 +267,14 @@ export const ApiService = {
       `${API_BASE}/copilot/kpis?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
     ),
   getClaudeKpis: (periodType: TimeGrain = "MONTHLY", periodKey = "2026-10") =>
-    USE_DUMMY_DATA
-      ? Promise.resolve(demoPlatformKpis("claude", periodType))
-      : requestJson<PlatformKPIs>(
-          `${API_BASE}/claude/kpis?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
-        ),
+    requestJson<PlatformKPIs>(
+      `${API_BASE}/claude/kpis?period_type=${periodType}&period_key=${encodeURIComponent(periodKey)}`,
+    ),
+  // Claude always reads the backend: the raw Anthropic reports are the source.
   getClaudeReportAnalytics: (periodKey: string): Promise<ClaudeReportAnalytics> =>
-    USE_DUMMY_DATA
-      ? Promise.resolve(demoClaudeReport(periodKey))
-      : requestJson<ClaudeReportAnalytics>(
-          `${API_BASE}/claude/analytics?period_key=${encodeURIComponent(periodKey)}`,
-        ),
+    requestJson<ClaudeReportAnalytics>(
+      `${API_BASE}/claude/analytics?period_key=${encodeURIComponent(periodKey)}`,
+    ),
 
   getChatGPTKpis: (periodType: TimeGrain = "MONTHLY", periodKey = "2026-10") =>
     USE_DUMMY_DATA

@@ -111,3 +111,36 @@ def chatgpt_cost_join_extra(period_key: Optional[str], alias: str = "c") -> str:
         return f" AND {chatgpt_cost_period(period_key, alias)}"
     return ""
 
+
+# --- Raw Anthropic report tables (claude_user_usage_report / claude_user_cost_report) ---
+# These tables store the API's report-bucket interval in starting_at / ending_at.
+# Monthly: the bucket starts inside the month and ends by the first day after it.
+# Weekly: the last 7 days ending at the newest ending_at in the table.
+
+CLAUDE_USAGE_TABLE = "claude_user_usage_report"
+CLAUDE_COST_TABLE = "claude_user_cost_report"
+
+
+def _raw_report_period(period_key: Optional[str], table: str, alias: str = "") -> str:
+    p = f"{alias}." if alias else ""
+    if is_weekly(period_key):
+        return (
+            f"({p}starting_at >= (SELECT MAX(ending_at) FROM {table}) - INTERVAL '7 days' "
+            f"AND {p}ending_at <= (SELECT MAX(ending_at) FROM {table}))"
+        )
+    start, _ = period_range(period_key)
+    if start is not None:
+        return (
+            f"({p}starting_at >= (CAST(%(period_start)s AS timestamp) AT TIME ZONE 'UTC') "
+            f"AND {p}ending_at <= ((CAST(%(period_end)s AS date) + INTERVAL '1 day') AT TIME ZONE 'UTC'))"
+        )
+    return "TRUE"
+
+
+def claude_raw_usage_period(period_key: Optional[str], alias: str = "") -> str:
+    return _raw_report_period(period_key, CLAUDE_USAGE_TABLE, alias)
+
+
+def claude_raw_cost_period(period_key: Optional[str], alias: str = "") -> str:
+    return _raw_report_period(period_key, CLAUDE_COST_TABLE, alias)
+

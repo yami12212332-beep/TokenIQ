@@ -4,12 +4,50 @@ Workday and general organization analytics routes
 import logging
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Query
-from services.periods import claude_cost_join_extra, claude_usage_period, claude_cost_period, copilot_detail_period
+from services.periods import claude_raw_cost_period, claude_raw_usage_period, copilot_detail_period
 from services.database import query_rows, COPILOT_SEAT_PRICE, CLAUDE_BASE_SEAT_PRICE
 from schemas.analytics import ManagerSummaryModel, DepartmentSummaryModel
 
 logger = logging.getLogger("backend.routes.analytics")
 router = APIRouter(prefix="/api", tags=["Analytics"])
+
+
+def _claude_agg_cte(period_key: str) -> str:
+    """Claude per-user aggregates from the raw Anthropic report tables.
+
+    Usage and cost are aggregated separately before the full join so multiple
+    cost rows for one user/model/day cannot multiply token counts.
+    """
+    usage_period = claude_raw_usage_period(period_key, "u")
+    cost_period = claude_raw_cost_period(period_key, "c")
+    return f"""claude_usage_agg AS (
+                SELECT LOWER(COALESCE(u.actor_email, w.email_work)) AS email,
+                       SUM(COALESCE(u.uncached_input_tokens,0) + COALESCE(u.output_tokens,0)
+                           + COALESCE(u.cache_read_input_tokens,0)
+                           + COALESCE(u.ephemeral_5m_input_tokens,0)
+                           + COALESCE(u.ephemeral_1h_input_tokens,0)) AS total_tokens,
+                       SUM(COALESCE(u.requests,0)) AS requests
+                FROM claude_user_usage_report u
+                LEFT JOIN workday_employees w ON u.actor_user_id = w.user_id
+                WHERE {usage_period}
+                GROUP BY LOWER(COALESCE(u.actor_email, w.email_work))
+            ),
+            claude_cost_agg AS (
+                SELECT LOWER(COALESCE(c.actor_email, w.email_work)) AS email,
+                       SUM(COALESCE(c.amount,0)) / 100.0 AS token_cost
+                FROM claude_user_cost_report c
+                LEFT JOIN workday_employees w ON c.actor_user_id = w.user_id
+                WHERE {cost_period}
+                GROUP BY LOWER(COALESCE(c.actor_email, w.email_work))
+            ),
+            claude_agg AS (
+                SELECT COALESCE(u.email, c.email) AS email,
+                       COALESCE(u.total_tokens,0) AS total_tokens,
+                       COALESCE(u.requests,0) AS requests,
+                       COALESCE(c.token_cost,0) AS token_cost
+                FROM claude_usage_agg u
+                FULL OUTER JOIN claude_cost_agg c ON u.email = c.email
+            )"""
 
 @router.get("/time-periods")
 async def get_time_periods():
@@ -107,19 +145,7 @@ async def get_analytics_by_manager(
                 WHERE {copilot_detail_period(period_key)}
                 GROUP BY LOWER(user_principal_name)
             ),
-            claude_agg AS (
-                SELECT 
-                    LOWER(COALESCE(u.email, w.email_work)) as email,
-                    SUM(u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens) as total_tokens,
-                    SUM(u.request_count) as requests,
-                    SUM(COALESCE(c.total_cost_usd, 0.0)) as token_cost
-                FROM claude_usage_user_detail u
-                LEFT JOIN workday_employees w ON u.user_id = w.user_id
-                LEFT JOIN claude_cost_user_detail c 
-                    ON u.user_id = c.user_id AND u.report_period = c.report_period AND u.model = c.model AND c.cost_date = u.usage_date{claude_cost_join_extra(period_key)}
-                WHERE {claude_usage_period(period_key, 'u')}
-                GROUP BY LOWER(COALESCE(u.email, w.email_work))
-            )
+            {_claude_agg_cte(period_key)}
             SELECT 
                 w.manager_name,
                 w.manager_user_name,
@@ -212,18 +238,7 @@ async def get_analytics_by_department(
                 WHERE {copilot_detail_period(period_key)}
                 GROUP BY LOWER(user_principal_name)
             ),
-            claude_agg AS (
-                SELECT 
-                    LOWER(COALESCE(u.email, w.email_work)) as email,
-                    SUM(u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens) as total_tokens,
-                    SUM(COALESCE(c.total_cost_usd, 0.0)) as token_cost
-                FROM claude_usage_user_detail u
-                LEFT JOIN workday_employees w ON u.user_id = w.user_id
-                LEFT JOIN claude_cost_user_detail c 
-                    ON u.user_id = c.user_id AND u.report_period = c.report_period AND u.model = c.model AND c.cost_date = u.usage_date{claude_cost_join_extra(period_key)}
-                WHERE {claude_usage_period(period_key, 'u')}
-                GROUP BY LOWER(COALESCE(u.email, w.email_work))
-            )
+            {_claude_agg_cte(period_key)}
             SELECT 
                 w.department,
                 w.division,
@@ -369,7 +384,7 @@ async def get_claude_joined_employees(
 
     return {
         "status": "success",
-        "join_key": "LOWER(workday_employees.email_work) = LOWER(claude_usage_user_detail.email)",
+        "join_key": "LOWER(workday_employees.email_work) = LOWER(claude_user_usage_report.actor_email)",
         "strategy": "INNER JOIN",
         "count": len(rows),
         "data": rows,
