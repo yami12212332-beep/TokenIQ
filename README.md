@@ -39,7 +39,7 @@ psql -U postgres -d tokeniq_db -f db/seed.sql
 
 ```bash
 cp backend/.env.example backend/.env    # set DB_NAME=tokeniq_db + credentials
-cp frontend/.env.example frontend/.env  # VITE_API_URL=http://127.0.0.1:8001
+cp frontend/.env.example frontend/.env  # VITE_API_URL=/ (Vite proxies /api to :8001)
 ```
 
 ### 3. Run
@@ -69,6 +69,12 @@ Health check: `http://127.0.0.1:8001/api/health`
 
 The backend rewrites `workday_employees` to `assetiq_fdw.workday_employees`, so
 employee names, departments, and the EVP hierarchy come from `assetiq_db`.
+
+## Production deployment
+
+Before running this on a production server, work through
+[`PRODUCTION_CHECKLIST.md`](PRODUCTION_CHECKLIST.md) — database/FDW verification,
+environment variables, security, build steps, post-deploy checks, and rollback.
 
 ## Project structure
 
