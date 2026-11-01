@@ -693,6 +693,9 @@ async def _copilot_records(period_key: str, period_type: str) -> list[dict]:
             }
         )
 
+    # Export only Copilot-licensed users. Workday employees without a Copilot
+    # licence must not appear, while licensed users with no Workday row do.
+    records = [r for r in records if r["licensed"]]
     records.sort(key=lambda r: (r["name"].lower(), r["email"]))
     return records
 
