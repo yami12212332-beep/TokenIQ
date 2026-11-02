@@ -286,7 +286,7 @@ class WorkdayEmployee(Base):
     team_member_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Manager hierarchy (Level 1 through 9)
-    manager_level_1_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    manager_level_1_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     manager_level_1_user_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     manager_level_2_user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     manager_level_2_user_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

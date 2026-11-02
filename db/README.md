@@ -199,6 +199,15 @@ workday_employees.user_id = <telemetry>.user_id
 This is why employee names/departments/EVP hierarchy must exist in
 `assetiq_db.workday_employees`.
 
+### Column type note
+
+`manager_level_1_user_id` is **`bigint`** (a numeric Workday user id) in both
+`assetiq_schema.sql` and the FDW foreign table. The bundled demo seed uses
+`1000` for the CEO. If your production Workday feed uses numeric ids for the
+other levels (`manager_level_2_user_id` … `manager_level_9_user_id`), convert
+those columns the same way and update the FDW foreign table to match — the
+remote and foreign-table types must be identical or PostgreSQL raises an error.
+
 ## Regenerating the seeds
 
 Copilot rows and the employee seed were produced from a live DB with `pg_dump --inserts`:

@@ -103,7 +103,7 @@ async def test_sqlalchemy_table_creation_and_orm_queries():
             employee_status="Active",
             manager_name="Sarah Jenkins",
             manager_user_name="sjenkins",
-            manager_level_1_user_id="EVP001",
+            manager_level_1_user_id=1000,
             manager_level_1_user_name="Sarah Jenkins",
         )
         session.add(emp)

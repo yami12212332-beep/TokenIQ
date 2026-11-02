@@ -64,7 +64,7 @@ CREATE FOREIGN TABLE IF NOT EXISTS assetiq_fdw.workday_employees (
     updated_at timestamp with time zone,
     last_synced_at timestamp with time zone NOT NULL,
     team_member_id character varying(64),
-    manager_level_1_user_id character varying(64),
+    manager_level_1_user_id bigint,
     manager_level_1_user_name character varying(255),
     manager_level_2_user_id character varying(64),
     manager_level_2_user_name character varying(255),

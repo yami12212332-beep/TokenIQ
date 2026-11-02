@@ -37,6 +37,8 @@ Use this before exposing TokenIQ on a production server. Tick every item.
 - [ ] Database exists with `public.workday_employees`.
 - [ ] If missing: `psql -U <user> -d assetiq_db -f db/assetiq_schema.sql`.
 - [ ] Production Workday data loaded (real loader, not demo seed).
+- [ ] `manager_level_1_user_id` is **`bigint`** in `assetiq_db` (and the FDW
+      foreign table). A varchar/bigint mismatch raises a PostgreSQL error.
 
 ### FDW link
 - [ ] Edit `db/fdw_workday.sql` host/port/dbname/credentials for prod.

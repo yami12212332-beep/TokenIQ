@@ -182,3 +182,59 @@ Expected after the local demo seed (for reference only):
   updated too.
 - No destructive migration is included in this branch. All local setup was done on an
   empty database; the server must not be truncated.
+
+---
+
+## 7. `manager_level_1_user_id` is BIGINT (type alignment)
+
+Workday exports `manager_level_1_user_id` as a numeric user id. The local schema,
+FDW foreign table, seed, and backend model previously used `varchar(64)`, which
+causes a column-type mismatch when the remote `assetiq_db` column is `bigint`.
+
+### Server apply (only if the column is still varchar)
+
+Run against **`assetiq_db`**:
+
+```sql
+-- Existing non-numeric values must be converted first; NULL/empty stays NULL.
+ALTER TABLE public.workday_employees
+  ALTER COLUMN manager_level_1_user_id TYPE bigint
+  USING NULLIF(TRIM(manager_level_1_user_id), '')::bigint;
+```
+
+Run against **`tokeniq_db`**:
+
+```sql
+ALTER FOREIGN TABLE assetiq_fdw.workday_employees
+  ALTER COLUMN manager_level_1_user_id TYPE bigint;
+```
+
+If the production columns are already `bigint`, these are no-ops — verify instead
+of running them blindly.
+
+### Verify
+
+```sql
+-- assetiq_db
+SELECT data_type
+FROM information_schema.columns
+WHERE table_name = 'workday_employees'
+  AND column_name = 'manager_level_1_user_id';   -- bigint
+
+-- tokeniq_db
+SELECT manager_level_1_user_id, pg_typeof(manager_level_1_user_id)
+FROM assetiq_fdw.workday_employees
+LIMIT 1;                                          -- bigint
+```
+
+### Code changes in this branch
+
+- `db/assetiq_schema.sql`, `db/fdw_workday.sql` → `manager_level_1_user_id bigint`
+- `db/seed_assetiq_employees.sql` → numeric ids (`1000` for the demo CEO)
+- `backend/models/tables.py` → `manager_level_1_user_id: Mapped[Optional[int]]`
+  (`BigInteger`)
+- `backend/tests/test_sqlalchemy_models.py` → numeric test fixture
+
+Restart the backend after applying. The other `manager_level_N_user_id`
+columns remain `varchar(64)` in this branch; convert them the same way if the
+production Workday feed uses numeric ids for those levels too.
