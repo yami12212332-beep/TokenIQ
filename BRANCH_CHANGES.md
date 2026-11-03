@@ -260,15 +260,17 @@ renamed to `.xlsx`.
 - **ChatGPT** — 16 columns, with a visible “demo data” note until the
   `chatgpt_*` tables are loaded.
 - **Overall** — 5 sheets:
-  1. **Dashboard** — departments, then EVPs, with active users and spend per
-     provider plus total spend. It counts only users with a provider licence;
-     departments/EVPs with no licensed users are omitted.
+  1. **Dashboard** — a "Combined AI Spend by Department" table (Department,
+     Employees, Copilot/Claude/ChatGPT spend, Total), a horizontal bar chart of
+     total spend by department, and three side-by-side provider tables
+     (ChatGPT / Claude / Copilot) with Department, Users, Spend and a Total row.
+     Only users with a provider licence are counted.
   2. **Overall** — 18 user-level columns, filtered to users with at least one
      provider licence (Copilot, Claude, or ChatGPT), whether or not they have a
      Workday row. October 2026: 58 users = 54 Workday + 4 non-Workday.
-  3. **Copilot** — the Copilot sheet.
-  4. **Claude** — the Claude sheet.
-  5. **ChatGPT** — the ChatGPT sheet (demo note while tables are absent).
+  3. **Copilot Oct 2026** — the Copilot sheet (sheet name includes the period).
+  4. **Claude Oct 2026** — the Claude sheet.
+  5. **ChatGPT Oct 2026** — the ChatGPT sheet (demo note while tables are absent).
 - Non-Workday telemetry users are included in Copilot, Claude, and Overall with
   blank Workday fields and `Unassigned` department/EVP.
 - Frontend: export timeout raised to 20 s; the offline fallback now downloads a

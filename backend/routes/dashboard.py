@@ -5,7 +5,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from services.periods import claude_raw_cost_period, claude_raw_usage_period, copilot_detail_period, chatgpt_cost_join_extra, chatgpt_usage_period, chatgpt_cost_period, period_range
 from services.database import query_rows, get_existing_tables, COPILOT_SEAT_PRICE, CLAUDE_BASE_SEAT_PRICE, CHATGPT_SEAT_PRICE
@@ -561,18 +562,29 @@ OVERALL_EXPORT_HEADERS = [
 ]
 
 DASHBOARD_HEADERS = [
-    "Name", "Employees", "Copilot Active Users", "Copilot Spend ($)",
-    "Claude Active Users", "Claude Seat Cost ($)", "Claude Token Cost ($)",
-    "Claude Total Cost ($)", "ChatGPT Active Users", "ChatGPT Spend ($)",
-    "Total Spend ($)",
+    "Department", "Employees", "Copilot Spend ($)", "Claude Spend ($)",
+    "ChatGPT Spend ($)", "Total Spend ($)",
 ]
+
+DASHBOARD_PROVIDER_HEADERS = ["Department", "Users", "Spend ($)"]
 
 CURRENCY = '"$"#,##0.00'
 INTEGER = "#,##0"
 
+_DASH_THIN = Side(style="thin", color="B4C6E7")
+_DASH_BORDER = Border(left=_DASH_THIN, right=_DASH_THIN, top=_DASH_THIN, bottom=_DASH_THIN)
+
 
 def _period_mult(period_type: str) -> float:
     return 1.0 if period_type == "MONTHLY" else 0.25
+
+
+def _period_label(period_key: str) -> str:
+    """'2026-10' -> 'Oct 2026'; weekly/invalid keys are returned unchanged."""
+    try:
+        return datetime.strptime(period_key, "%Y-%m").strftime("%b %Y")
+    except (TypeError, ValueError):
+        return period_key or ""
 
 
 def _window_days(period_type: str) -> int:
@@ -1167,15 +1179,133 @@ def _write_table(ws, headers: list[str], rows: list[list], start_row: int = 1, f
     return row
 
 
-def _write_dashboard_sheet(ws, dept_rows: list[list], evp_rows: list[list], period_key: str) -> None:
-    ws.cell(row=1, column=1, value=f"TokenIQ Dashboard — {period_key}").font = Font(bold=True, size=14)
-    next_row = _write_table(ws, DASHBOARD_HEADERS, dept_rows, start_row=3, formats={
-        4: CURRENCY, 6: CURRENCY, 7: CURRENCY, 8: CURRENCY, 10: CURRENCY, 11: CURRENCY,
-    })
-    ws.cell(row=next_row + 1, column=1, value="By EVP").font = Font(bold=True, size=12)
-    _write_table(ws, DASHBOARD_HEADERS, evp_rows, start_row=next_row + 2, formats={
-        4: CURRENCY, 6: CURRENCY, 7: CURRENCY, 8: CURRENCY, 10: CURRENCY, 11: CURRENCY,
-    })
+def _write_dashboard_title(ws, row: int, first_col: int, last_col: int, text: str) -> None:
+    ws.merge_cells(start_row=row, start_column=first_col, end_row=row, end_column=last_col)
+    cell = ws.cell(row=row, column=first_col, value=text)
+    cell.font = Font(bold=True, color="FFFFFF", size=11)
+    cell.fill = PatternFill("solid", fgColor="1F4E78")
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    for col in range(first_col, last_col + 1):
+        ws.cell(row=row, column=col).border = _DASH_BORDER
+
+
+def _write_dashboard_table(
+    ws,
+    start_row: int,
+    start_col: int,
+    title: str,
+    headers: list[str],
+    rows: list[list],
+    total: list,
+    currency_cols: set[int],
+) -> int:
+    last_col = start_col + len(headers) - 1
+    _write_dashboard_title(ws, start_row, start_col, last_col, title)
+
+    header_row = start_row + 1
+    for offset, header in enumerate(headers):
+        cell = ws.cell(row=header_row, column=start_col + offset, value=header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2F5597")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = _DASH_BORDER
+
+    row_idx = header_row + 1
+    for band, data in enumerate(rows):
+        for offset, value in enumerate(data):
+            cell = ws.cell(row=row_idx, column=start_col + offset, value=value)
+            cell.border = _DASH_BORDER
+            if offset in currency_cols:
+                cell.number_format = CURRENCY
+            if band % 2 == 1:
+                cell.fill = PatternFill("solid", fgColor="F2F6FC")
+        row_idx += 1
+
+    for offset, value in enumerate(total):
+        cell = ws.cell(row=row_idx, column=start_col + offset, value=value)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+        cell.border = _DASH_BORDER
+        if offset in currency_cols:
+            cell.number_format = CURRENCY
+    return row_idx
+
+
+def _write_dashboard_sheet(ws, dept_rows: list[list], period_key: str) -> None:
+    """Department spend summary + horizontal bar chart + per-provider splits."""
+    period_label = _period_label(period_key)
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
+    title = ws.cell(row=1, column=1, value=f"Combined AI Spend by Department — {period_label}")
+    title.font = Font(bold=True, size=14, color="1F4E78")
+    title.alignment = Alignment(horizontal="left", vertical="center")
+
+    combined_rows = [
+        [r[0], r[1], r[3], r[7], r[9], r[10]]
+        for r in dept_rows
+    ]
+    combined_total = [
+        "Total",
+        sum(r[1] for r in dept_rows),
+        round(sum(r[3] for r in dept_rows), 2),
+        round(sum(r[7] for r in dept_rows), 2),
+        round(sum(r[9] for r in dept_rows), 2),
+        round(sum(r[10] for r in dept_rows), 2),
+    ]
+    total_row = _write_dashboard_table(
+        ws, 3, 1, "Combined AI Spend by Department", DASHBOARD_HEADERS,
+        combined_rows, combined_total, {2, 3, 4, 5},
+    )
+
+    header_row = 4
+    first_data_row = 5
+    last_data_row = total_row - 1
+
+    chart = BarChart()
+    chart.type = "bar"
+    chart.style = 10
+    chart.title = "Combined AI Spend by Department"
+    chart.y_axis.title = "Department"
+    chart.x_axis.title = "Total Spend ($)"
+    chart.add_data(
+        Reference(ws, min_col=6, min_row=header_row, max_row=last_data_row),
+        titles_from_data=True,
+    )
+    chart.set_categories(
+        Reference(ws, min_col=1, min_row=first_data_row, max_row=last_data_row)
+    )
+    chart.legend = None
+    chart.height = 9
+    chart.width = 17
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.x_axis.number_format = '"$"#,##0'
+    chart.x_axis.majorGridlines = None
+    ws.add_chart(chart, "H3")
+
+    provider_start = max(total_row + 3, 22)
+    providers = [
+        ("ChatGPT", 1, 8, 9),
+        ("Claude", 5, 4, 7),
+        ("Copilot", 9, 2, 3),
+    ]
+    for name, start_col, users_idx, spend_idx in providers:
+        rows = [[r[0], r[users_idx], round(r[spend_idx], 2)] for r in dept_rows]
+        total = [
+            "Total",
+            sum(r[users_idx] for r in dept_rows),
+            round(sum(r[spend_idx] for r in dept_rows), 2),
+        ]
+        _write_dashboard_table(
+            ws, provider_start, start_col, name, DASHBOARD_PROVIDER_HEADERS,
+            rows, total, {2},
+        )
+
+    widths = {"A": 26, "B": 12, "C": 18, "D": 18, "E": 24, "F": 16, "G": 16, "H": 4, "I": 24, "J": 12, "K": 16}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A4"
 
 
 def _xlsx_response(workbook: Workbook, filename: str) -> Response:
@@ -1201,6 +1331,7 @@ async def export_dashboard_excel(
     """
     current_tab = (tab or "overall").lower()
     period_type = period_type.upper()
+    period_label = _period_label(period_key)
 
     try:
         workday_users = await _load_dashboard_users(period_key, period_type)
@@ -1211,14 +1342,14 @@ async def export_dashboard_excel(
         if current_tab == "copilot":
             workbook = Workbook()
             ws = workbook.active
-            ws.title = "Copilot"
+            ws.title = f"Copilot {period_label}"[:31]
             _write_table(ws, COPILOT_EXPORT_HEADERS, _copilot_export_rows(copilot), formats={14: CURRENCY})
             return _xlsx_response(workbook, f"TokenIQ_Copilot_{period_key}.xlsx")
 
         if current_tab == "claude":
             workbook = Workbook()
             ws = workbook.active
-            ws.title = "Claude"
+            ws.title = f"Claude {period_label}"[:31]
             _write_table(ws, CLAUDE_EXPORT_HEADERS, _claude_export_rows(claude), formats={
                 10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER, 15: INTEGER,
                 16: CURRENCY, 17: CURRENCY,
@@ -1228,7 +1359,7 @@ async def export_dashboard_excel(
         if current_tab == "chatgpt":
             workbook = Workbook()
             ws = workbook.active
-            ws.title = "ChatGPT"
+            ws.title = f"ChatGPT {period_label}"[:31]
             start_row = 1
             if chatgpt_is_demo:
                 ws.cell(row=1, column=1, value="Demo data — chatgpt_* tables are not loaded.").font = Font(italic=True, color="C00000")
@@ -1242,28 +1373,27 @@ async def export_dashboard_excel(
         # Overall workbook: 5 sheets.
         overall = _overall_records(workday_users, copilot, claude, chatgpt, chatgpt_is_demo)
         dept_rows = _summary_rows(overall, "department")
-        evp_rows = _summary_rows(overall, "evp")
 
         workbook = Workbook()
         dashboard = workbook.active
         dashboard.title = "Dashboard"
-        _write_dashboard_sheet(dashboard, dept_rows, evp_rows, period_key)
+        _write_dashboard_sheet(dashboard, dept_rows, period_key)
 
         overall_sheet = workbook.create_sheet("Overall")
         _write_table(overall_sheet, OVERALL_EXPORT_HEADERS, _overall_export_rows(overall, period_key), formats={
             11: CURRENCY, 13: INTEGER, 14: CURRENCY, 16: INTEGER, 17: CURRENCY, 18: CURRENCY,
         })
 
-        copilot_sheet = workbook.create_sheet("Copilot")
+        copilot_sheet = workbook.create_sheet(f"Copilot {period_label}"[:31])
         _write_table(copilot_sheet, COPILOT_EXPORT_HEADERS, _copilot_export_rows(copilot), formats={14: CURRENCY})
 
-        claude_sheet = workbook.create_sheet("Claude")
+        claude_sheet = workbook.create_sheet(f"Claude {period_label}"[:31])
         _write_table(claude_sheet, CLAUDE_EXPORT_HEADERS, _claude_export_rows(claude), formats={
             10: INTEGER, 11: INTEGER, 12: INTEGER, 13: INTEGER, 14: INTEGER, 15: INTEGER,
             16: CURRENCY, 17: CURRENCY,
         })
 
-        chatgpt_sheet = workbook.create_sheet("ChatGPT")
+        chatgpt_sheet = workbook.create_sheet(f"ChatGPT {period_label}"[:31])
         start_row = 1
         if chatgpt_is_demo:
             chatgpt_sheet.cell(row=1, column=1, value="Demo data — chatgpt_* tables are not loaded.").font = Font(italic=True, color="C00000")
