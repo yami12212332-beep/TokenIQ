@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from services.periods import claude_raw_cost_period, claude_raw_usage_period, copilot_detail_period, chatgpt_cost_join_extra, chatgpt_usage_period, chatgpt_cost_period, period_range
@@ -1258,6 +1260,10 @@ def _write_dashboard_sheet(ws, dept_rows: list[list], period_key: str) -> None:
         combined_rows, combined_total, {2, 3, 4, 5},
     )
 
+    # Department dropdown filter on the summary table. Excel charts are static
+    # objects, so this filters the table rows, not the chart itself.
+    ws.auto_filter.ref = f"A4:F{total_row - 1}"
+
     header_row = 4
     first_data_row = 5
     last_data_row = total_row - 1
@@ -1276,15 +1282,25 @@ def _write_dashboard_sheet(ws, dept_rows: list[list], period_key: str) -> None:
         Reference(ws, min_col=1, min_row=first_data_row, max_row=last_data_row)
     )
     chart.legend = None
-    chart.height = 9
+    # Grow with the department count so bars/labels stay readable.
+    chart.height = max(9.0, 0.55 * len(dept_rows) + 5.0)
     chart.width = 17
     chart.x_axis.delete = False
     chart.y_axis.delete = False
     chart.x_axis.number_format = '"$"#,##0'
     chart.x_axis.majorGridlines = None
+    # Remove the default gray chart-area and plot-area borders.
+    chart.graphical_properties = GraphicalProperties(ln=LineProperties(noFill=True))
+    chart.plot_area.graphicalProperties = GraphicalProperties(ln=LineProperties(noFill=True))
     ws.add_chart(chart, "H3")
 
-    provider_start = max(total_row + 3, 22)
+    # Keep the provider tables below the chart even when many departments make
+    # the chart grow (~1 row per 0.53 cm at Excel's default row height).
+    chart_bottom = 3 + int(chart.height / 0.529) + 1
+    provider_start = max(total_row + 3, chart_bottom, 22)
+
+    note = ws.cell(row=2, column=1, value="Tip: use the Department filter arrows in row 4 to filter the table. The chart is a snapshot of all departments.")
+    note.font = Font(italic=True, size=9, color="808080")
     providers = [
         ("ChatGPT", 1, 8, 9),
         ("Claude", 5, 4, 7),
